@@ -282,7 +282,7 @@ def create_parcelsfig_axis(spherical, land=True, projection=None, central_longit
                 gl = ax.gridlines(crs=cartopy.crs.PlateCarree(), draw_labels=True)  # central_lon=0 necessary for correct xlabels
             else:
                 gl = ax.gridlines(crs=projection, draw_labels=True)
-            gl.xlabels_top, gl.ylabels_right = (False, False)
+            gl.top_labels, gl.right_labels = (False, False)
             gl.xformatter = cartopy.mpl.gridliner.LONGITUDE_FORMATTER
             gl.yformatter = cartopy.mpl.gridliner.LATITUDE_FORMATTER
         except:
