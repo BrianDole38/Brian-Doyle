@@ -5,6 +5,7 @@ from os import path
 import numpy as np
 import pytest
 import xarray as xr
+from netCDF4 import Dataset
 
 from parcels import AdvectionRK4
 from parcels import ErrorCode
@@ -111,6 +112,34 @@ def test_globcurrent_time_periodic(mode, rundays):
         sample_var.append(pset[0].sample_var)
 
     assert np.allclose(sample_var[0], sample_var[1])
+
+
+@pytest.mark.parametrize('mode', ['jit'])
+@pytest.mark.parametrize('repeatdt', [86400, 2*86400])
+@pytest.mark.parametrize('maxage', [86400, 3*86400])
+def test_globcurrent_repeatdt_delete_particles(mode, repeatdt, maxage, tmpdir):
+    filename = tmpdir.join("pset_fromparticlefile.nc")
+    fieldset = set_globcurrent_fieldset()
+    fieldset.add_constant('maxage', maxage)
+    outputdt = delta(days=1).total_seconds()
+
+    class MyParticle(ptype[mode]):
+        age = Variable('age', initial=0)
+
+    def AgeP(particle, fieldset, time):
+        particle.age += particle.dt
+        if particle.age >= fieldset.maxage:
+            particle.delete()
+
+    pset = ParticleSet(fieldset, pclass=MyParticle, lon=25, lat=-35, repeatdt=repeatdt)
+    pfile = pset.ParticleFile(filename, outputdt=outputdt)
+
+    pset.execute(AdvectionRK4+pset.Kernel(AgeP), runtime=delta(days=20), dt=delta(hours=1), output_file=pfile)
+    pfile.close()
+
+    ncfile = Dataset(filename, 'r', 'NETCDF4')
+    times = ncfile.variables['time'][:]
+    assert np.allclose(np.diff(times), outputdt)
 
 
 @pytest.mark.parametrize('dt', [-300, 300])
