@@ -6,6 +6,7 @@ from datetime import timedelta as delta
 from os import path
 import time as time_module
 import cftime
+import sys  # noqa: F401
 
 from tqdm import tqdm
 
@@ -15,7 +16,7 @@ from parcels.compilation.codecompiler import GNUCompiler
 from parcels.field import NestedField
 from parcels.field import SummedField
 from parcels.application_kernels.advection import AdvectionRK4
-from parcels.kernel.basekernel import BaseKernel as Kernel
+from parcels.kernel.basekernel import BaseKernel
 from parcels.collection.collections import ParticleCollection
 from parcels.tools.loggers import logger
 from parcels.interaction.baseinteractionkernel import BaseInteractionKernel
@@ -28,16 +29,18 @@ class NDCluster(ABC):
 class BaseParticleSet(NDCluster):
     """Base ParticleSet."""
     _collection = None
-    kernel = None
+    _fieldset = None
+    _kernel = None
+    _kclass = None
     interaction_kernel = None
-    fieldset = None
     time_origin = None
-    repeat_starttime = None
+    repeatdt = None
+    repeatpclass = None
     repeatlon = None
     repeatlat = None
     repeatdepth = None
-    repeatpclass = None
     repeatkwargs = None
+    repeat_starttime = None
 
     def __init__(self, fieldset=None, pclass=None, lon=None, lat=None,
                  depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None, pid_orig=None, **kwargs):
@@ -48,15 +51,23 @@ class BaseParticleSet(NDCluster):
         self.repeatdepth = None
         self.repeatpclass = None
         self.repeatkwargs = None
-        self.kernel = None
+        self._kernel = None
         self.interaction_kernel = None
-        self.fieldset = None
+        self._fieldset = None
         self.time_origin = None
 
     def __del__(self):
         if self._collection is not None and isinstance(self._collection, ParticleCollection):
             del self._collection
+        else:
+            pass
         self._collection = None
+
+    def clear(self):
+        try:
+            self._collection.clear()
+        except (AttributeError):
+            pass
 
     def iterator(self):
         return self._collection.iterator()
@@ -96,6 +107,38 @@ class BaseParticleSet(NDCluster):
     def collection(self):
         return self._collection
 
+    @property
+    def fieldset(self):
+        return self._fieldset
+
+    # ==== no implementation of setter, as fieldset needs to be initialized on construction ==== #
+
+    @property
+    def kernel(self):
+        return self._kernel
+
+    # ==== no implementation of setter, as kernel needs to be initialized on construction ==== #
+
+    @property
+    def kernelclass(self):
+        return (self._kclass if self._kclass is not None else BaseKernel)
+
+    @kernelclass.setter
+    def kernelclass(self, value):
+        self._kclass = value
+
+    @property
+    def lonlatdepth_dtype(self):
+        return self._collection.lonlatdepth_dtype
+
+    @property
+    def ptype(self):
+        return self._collection.ptype
+
+    @property
+    def pclass(self):
+        return self._collection.pclass
+
     @abstractmethod
     def cstruct(self):
         """
@@ -104,7 +147,7 @@ class BaseParticleSet(NDCluster):
         """
         pass
 
-    def __create_progressbar(self, starttime, endtime):
+    def _create_progressbar_(self, starttime, endtime):
         pbar = tqdm(total=abs(endtime - starttime))
         pbar.prevtime = starttime
         return pbar
@@ -129,7 +172,7 @@ class BaseParticleSet(NDCluster):
         return cls(fieldset=fieldset, pclass=pclass, lon=lon, lat=lat, depth=depth, time=time, repeatdt=repeatdt, lonlatdepth_dtype=lonlatdepth_dtype, **kwargs)
 
     @classmethod
-    def from_line(cls, fieldset, pclass, start, finish, size, depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None):
+    def from_line(cls, fieldset, pclass, start, finish, size, depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None, **kwargs):
         """Initialise the ParticleSet from start/finish coordinates with equidistant spacing
         Note that this method uses simple numpy.linspace calls and does not take into account
         great circles, so may not be a exact on a globe
@@ -154,6 +197,116 @@ class BaseParticleSet(NDCluster):
             depth = [depth] * size
         return cls(fieldset=fieldset, pclass=pclass, lon=lon, lat=lat, depth=depth, time=time, repeatdt=repeatdt, lonlatdepth_dtype=lonlatdepth_dtype)
 
+    def merge(self, other):
+        """
+        This function merges another particle set into this one.
+        """
+        self._collection.merge(other.collection)
+
+    def split(self, keys):
+        """
+        splits a particle set according to indices or ids, returning the resulting new subset that is not part anymore of this particle set
+        :param key: indices (int; np.int32; np.uin32), or IDs (np.int64, np.uint64)
+        :return: ParticleSet
+        """
+        return self.split_same(keys)
+
+    def split_same(self, subset):
+        """
+        This function splits this collection into two disect equi-structured collections. The reason for it can, for
+        example, be that the set exceeds a pre-defined maximum number of elements, which for performance reasons
+        mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        subset_are_indices = False
+        subset_are_ids = False
+        assert subset is not None
+        assert (subset.shape[0] if isinstance(subset, np.ndarray) else len(subset)) > 0
+        if isinstance(subset, np.ndarray) and (subset.dtype == np.int32 or subset.dtype == np.uint32):
+            subset_are_indices = True
+        elif isinstance(subset, list) and len(subset) > 0 and (isinstance(subset[0], int) or isinstance(subset[0], np.int32) or isinstance(subset[0], np.uint32)):
+            subset_are_indices = True
+        elif isinstance(subset, np.ndarray) and (subset.dtype == np.int64 or subset.dtype == np.uint64):
+            subset_are_ids = True
+        elif isinstance(subset, list) and len(subset) > 0 and (isinstance(subset[0], int) or isinstance(subset[0], np.int64) or isinstance(subset[0], np.uint64)):
+            subset_are_ids = True
+        assert subset_are_ids or subset_are_indices
+        if subset_are_indices:
+            return self.split_by_index(subset)
+        elif subset_are_ids:
+            return self.split_by_id(subset)
+        return None
+
+    @abstractmethod
+    def split_by_index(self, indices):
+        """
+        This function splits this collection into two disect equi-structured collections using the indices as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        subset_are_indices = False
+        assert indices is not None
+        assert (indices.shape[0] if isinstance(indices, np.ndarray) else len(indices)) > 0
+        if isinstance(indices, np.ndarray) and (indices.dtype == np.int32 or indices.dtype == np.uint32):
+            subset_are_indices = True
+        elif isinstance(indices, list) and len(indices) > 0 and (isinstance(indices[0], int) or isinstance(indices[0], np.int32) or isinstance(indices[0], np.uint32)):
+            subset_are_indices = True
+        assert subset_are_indices
+        return None
+
+    @abstractmethod
+    def split_by_id(self, ids):
+        """
+        This function splits this collection into two disect equi-structured collections using the ID as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        subset_are_ids = False
+        assert ids is not None
+        assert (ids.shape[0] if isinstance(ids, np.ndarray) else len(ids)) > 0
+        if isinstance(ids, np.ndarray) and (ids.dtype == np.int64 or ids.dtype == np.uint64):
+            subset_are_ids = True
+        elif isinstance(ids, list) and len(ids) > 0 and (isinstance(ids[0], int) or isinstance(ids[0], np.int64) or isinstance(ids[0], np.uint64)):
+            subset_are_ids = True
+        assert subset_are_ids
+        return None
+
+    @property
+    def size(self):
+        # ==== to change at some point - len and size are different things ==== #
+        return len(self._collection)
+
+    def __len__(self):
+        """
+        :returns number of elements in the particle set
+        """
+        return len(self._collection)
+
+    def __sizeof__(self):
+        """
+        This function returns the size in actual bytes required in memory to hold the particle set. Ideally and simply,
+        the size is computed as follows:
+
+        sizeof(self) = len(self) * sizeof(pclass)
+        :returns size of this collection in bytes; initiated by calling sys.getsizeof(object)
+        """
+        sz = sys.getsizeof(self._collection)
+        sz += sys.getsizeof(self._kernel)
+        sz += sys.getsizeof(self.repeatdt) if self.repeatdt is not None else 0
+        sz += sys.getsizeof(self.repeatlon) if self.repeatlon is not None else 0
+        sz += sys.getsizeof(self.repeatlat) if self.repeatlat is not None else 0
+        sz += sys.getsizeof(self.repeatdepth) if self.repeatdepth is not None else 0
+        sz += sys.getsizeof(self.repeatkwargs) if self.repeatkwargs is not None else 0
+        return sz
+
     @classmethod
     @abstractmethod
     def monte_carlo_sample(cls, start_field, size, mode='monte_carlo'):
@@ -167,7 +320,7 @@ class BaseParticleSet(NDCluster):
         pass
 
     @classmethod
-    def from_field(cls, fieldset, pclass, start_field, size, mode='monte_carlo', depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None):
+    def from_field(cls, fieldset, pclass, start_field, size, mode='monte_carlo', depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None, **kwargs):
         """Initialise the ParticleSet randomly drawn according to distribution from a field
 
         :param fieldset: :mod:`parcels.fieldset.FieldSet` object from which to sample velocity
@@ -326,13 +479,20 @@ class BaseParticleSet(NDCluster):
         :param postIterationCallbacks: (Optional) Array of functions that are to be called after each iteration (post-process, non-Kernel)
         :param callbackdt: (Optional, in conjecture with 'postIterationCallbacks) timestep inverval to (latestly) interrupt the running kernel and invoke post-iteration callbacks from 'postIterationCallbacks'
         """
-        # check if pyfunc has changed since last compile. If so, recompile
+        # check if pyfunc has changed since last compile. If so, recompile.
+        # COMMENT #1034: this still needs to check that the ParticleClass name also didn't change!
         if self.kernel is None or (self.kernel.pyfunc is not pyfunc and self.kernel is not pyfunc):
             # Generate and store Kernel
-            if isinstance(pyfunc, Kernel):
-                self.kernel = pyfunc
+            if isinstance(pyfunc, BaseKernel):
+                assert isinstance(pyfunc, self.kernelclass), "Trying to mix kernels of different particle set structures - action prohibited. Please construct the kernel for this specific particle set '{}'.".format(type(self).__name__)
+                if pyfunc.ptype.name == self.collection.ptype.name:
+                    self._kernel = pyfunc
+                elif pyfunc.pyfunc is not None:
+                    self._kernel = self.Kernel(pyfunc.pyfunc)
+                else:
+                    raise RuntimeError("Cannot reuse concatenated kernels that were compiled for different particle types. Please rebuild the 'pyfunc' or 'kernel' given to the execute function.")
             else:
-                self.kernel = self.Kernel(pyfunc)
+                self._kernel = self.Kernel(pyfunc)
             # Prepare JIT kernel execution
             if self.collection.ptype.uses_jit:
                 self.kernel.remove_lib()
@@ -427,10 +587,13 @@ class BaseParticleSet(NDCluster):
         next_input = self.fieldset.computeTimeChunk(time, np.sign(dt)) if self.fieldset is not None else np.inf
 
         tol = 1e-12
+
+        pbar = None
+        walltime_start = None
         if verbose_progress is None:
             walltime_start = time_module.time()
         if verbose_progress:
-            pbar = self.__create_progressbar(_starttime, endtime)
+            pbar = self._create_progressbar_(_starttime, endtime)
 
         while (time < endtime and dt > 0) or (time > endtime and dt < 0) or dt == 0:
             if verbose_progress is None and time_module.time() - walltime_start > 10:
@@ -439,7 +602,7 @@ class BaseParticleSet(NDCluster):
                     logger.info('Temporary output files are stored in %s.' % output_file.tempwritedir_base)
                     logger.info('You can use "parcels_convert_npydir_to_netcdf %s" to convert these '
                                 'to a NetCDF file during the run.' % output_file.tempwritedir_base)
-                pbar = self.__create_progressbar(_starttime, endtime)
+                pbar = self._create_progressbar_(_starttime, endtime)
                 verbose_progress = True
 
             if dt > 0:

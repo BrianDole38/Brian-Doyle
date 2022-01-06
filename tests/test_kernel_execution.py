@@ -5,14 +5,16 @@ from parcels import (
 )
 from parcels import ParticleSetSOA, ParticleFileSOA, KernelSOA  # noqa
 from parcels import ParticleSetAOS, ParticleFileAOS, KernelAOS  # noqa
+from parcels import ParticleSetNodes, ParticleFileNodes, KernelNodes  # noqa
 import numpy as np
 import pytest
 import sys
 
-pset_modes = ['soa', 'aos']
+pset_modes = ['soa', 'aos', 'nodes']
 ptype = {'scipy': ScipyParticle, 'jit': JITParticle}
 pset_type = {'soa': {'pset': ParticleSetSOA, 'pfile': ParticleFileSOA, 'kernel': KernelSOA},
-             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS}}
+             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS},
+             'nodes': {'pset': ParticleSetNodes, 'pfile': ParticleFileNodes, 'kernel': KernelNodes}}
 
 
 def DoNothing(particle, fieldset, time):
@@ -293,9 +295,9 @@ def test_statuscode_repeat(fieldset, pset_mode, mode):
 def test_execution_keep_cfiles_and_nocompilation_warnings(pset_mode, fieldset, delete_cfiles):
     pset = pset_type[pset_mode]['pset'](fieldset, pclass=JITParticle, lon=[0.], lat=[0.])
     pset.execute(pset.Kernel(AdvectionRK4, delete_cfiles=delete_cfiles), endtime=1., dt=1.)
-    cfile = pset.kernel.src_file
+    cfile = pset.kernel.dyn_srcs[0]
     logfile = pset.kernel.log_file
-    del pset.kernel
+    del pset
     if delete_cfiles:
         assert not path.exists(cfile)
     else:

@@ -1,7 +1,8 @@
-from parcels import FieldSet, ScipyParticle, JITParticle, Variable, AdvectionRK4, AdvectionRK4_3D, RectilinearZGrid, ErrorCode, OutOfTimeError
+from parcels import FieldSet, ScipyParticle, JITParticle, Variable, AdvectionRK4, AdvectionRK4_3D, RectilinearZGrid, StateCode, OutOfTimeError
 from parcels.field import Field, VectorField
 from parcels import ParticleSetSOA, ParticleFileSOA, KernelSOA  # noqa
 from parcels import ParticleSetAOS, ParticleFileAOS, KernelAOS  # noqa
+from parcels import ParticleSetNodes, ParticleFileNodes, KernelNodes  # noqa
 from parcels.tools.converters import TimeConverter, _get_cftime_calendars, _get_cftime_datetimes, UnitConverter, GeographicPolar
 import dask.array as da
 import dask
@@ -17,10 +18,11 @@ import psutil
 import os
 import sys
 
-pset_modes = ['soa', 'aos']
+pset_modes = ['soa', 'aos', 'nodes']
 ptype = {'scipy': ScipyParticle, 'jit': JITParticle}
 pset_type = {'soa': {'pset': ParticleSetSOA, 'pfile': ParticleFileSOA, 'kernel': KernelSOA},
-             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS}}
+             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS},
+             'nodes': {'pset': ParticleSetNodes, 'pfile': ParticleFileNodes, 'kernel': KernelNodes}}
 
 
 def generate_fieldset(xdim, ydim, zdim=1, tdim=1):
@@ -571,7 +573,7 @@ def test_add_second_vector_field(pset_mode, mode):
         particle.lat += v * particle.dt
 
     pset = pset_type[pset_mode]['pset'](fieldset, pclass=ptype[mode], lon=0.5, lat=0.5)
-    pset.execute(AdvectionRK4+pset.Kernel(SampleUV2), dt=1, runtime=1)
+    pset.execute(pset.Kernel(AdvectionRK4)+pset.Kernel(SampleUV2), dt=1, runtime=1)
 
     assert abs(pset.lon[0] - 2.5) < 1e-9
     assert abs(pset.lat[0] - .5) < 1e-9
@@ -589,7 +591,6 @@ def test_fieldset_write(pset_mode, tmpdir):
     dimensions = {'U': {'lat': lat, 'lon': lon},
                   'V': {'lat': lat, 'lon': lon}}
     fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
-
     fieldset.U.to_write = True
 
     def UpdateU(particle, fieldset, time):
@@ -602,34 +603,53 @@ def test_fieldset_write(pset_mode, tmpdir):
     pset.execute(UpdateU, dt=1, runtime=10, output_file=ofile)
 
     assert fieldset.U.data[0, 1, 0] == 11
-
     da = xr.open_dataset(str(filepath).replace('.nc', '_0005U.nc'))
     assert np.allclose(fieldset.U.data, da['U'].values)
 
 
-@pytest.mark.parametrize('pset_mode', pset_modes)
+@pytest.mark.parametrize('pset_mode', ['aos', 'soa'])
 @pytest.mark.parametrize('mode', ['scipy', 'jit'])
 @pytest.mark.parametrize('time_periodic', [4*86400.0, False])
-@pytest.mark.parametrize('dt', [-3600, 3600])
 @pytest.mark.parametrize('chunksize', [False, 'auto', {'time': ('time_counter', 1), 'lat': ('y', 32), 'lon': ('x', 32)}])
 @pytest.mark.parametrize('with_GC', [False, True])
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="skipping windows test as windows memory leaks (#787)")
-def test_from_netcdf_memory_containment(pset_mode, mode, time_periodic, dt, chunksize, with_GC):
+def test_from_netcdf_memory_containment(pset_mode, mode, time_periodic, chunksize, with_GC):
+    """
+    The fixed max. memory cap in 'field_step_max' is directly calculated and shall not be changed anymore.
+    It's based on the following values:
+    # x-entries: 512
+    # y values: 128
+    # time allocations: 4
+    # fields loaded: 2
+    # buffered timesteps: 2
+    SciPy-Buffers 1; JIT-Buffers: 2
+    """
+    dt = 3600.0
     if time_periodic and dt < 0:
         return True  # time_periodic does not work in backward-time mode
     if chunksize == 'auto':
-        dask.config.set({'array.chunk-size': '2MiB'})
+        dask.config.set({'array.chunk-size': '128KiB'})
     else:
         dask.config.set({'array.chunk-size': '128MiB'})
 
     class PerformanceLog():
         samples = []
         memory_steps = []
+        pset = None
+        pfile = None
         _iter = 0
+        _process = None
+
+        def __init__(self):
+            self._process = psutil.Process(os.getpid())
 
         def advance(self):
-            process = psutil.Process(os.getpid())
-            self.memory_steps.append(process.memory_info().rss)
+            offset = 0
+            if self.pset is not None:
+                offset -= sys.getsizeof(self.pset)
+            if self.pfile is not None:
+                offset -= sys.getsizeof(self.pfile)
+            self.memory_steps.append(self._process.memory_info().rss - offset)
             self.samples.append(self._iter)
             self._iter += 1
 
@@ -646,8 +666,6 @@ def test_from_netcdf_memory_containment(pset_mode, mode, time_periodic, dt, chun
         while particle.lat < -90.:
             particle.lat += 180.
 
-    process = psutil.Process(os.getpid())
-    mem_0 = process.memory_info().rss
     fnameU = path.join(path.dirname(__file__), 'test_data', 'perlinfieldsU.nc')
     fnameV = path.join(path.dirname(__file__), 'test_data', 'perlinfieldsV.nc')
     ufiles = [fnameU, ] * 4
@@ -663,18 +681,31 @@ def test_from_netcdf_memory_containment(pset_mode, mode, time_periodic, dt, chun
     postProcessFuncs = [perflog.advance, ]
     if with_GC:
         postProcessFuncs.append(perIterGC)
+    perflog.advance()
     pset = pset_type[pset_mode]['pset'](fieldset=fieldset, pclass=ptype[mode], lon=[0.5, ], lat=[0.5, ])
-    mem_0 = process.memory_info().rss
+    perflog.pset = pset
     mem_exhausted = False
     try:
-        pset.execute(pset.Kernel(AdvectionRK4)+periodicBoundaryConditions, dt=dt, runtime=delta(days=7), postIterationCallbacks=postProcessFuncs, callbackdt=delta(hours=12))
+        pset.execute(pset.Kernel(AdvectionRK4)+periodicBoundaryConditions, dt=dt, runtime=delta(days=7), postIterationCallbacks=postProcessFuncs, callbackdt=delta(hours=10))
     except MemoryError:
         mem_exhausted = True
     mem_steps_np = np.array(perflog.memory_steps)
+    field_step_max = ((4*8+512*128*4+512*128*4+(512*128*4))*2*2)
+    if mode != 'scipy':
+        field_step_max *= 2
     if with_GC:
-        assert np.allclose(mem_steps_np[8:], perflog.memory_steps[-1], rtol=0.01)
-    if (chunksize is not False or with_GC) and mode != 'scipy':
-        assert np.alltrue((mem_steps_np-mem_0) <= 5275648)  # represents 4 x [U|V] * sizeof(field data) + 562816
+        if chunksize is not False:
+            N = mem_steps_np.shape[0]
+            mem0 = mem_steps_np[0]
+            # flat-lining - here, the line shall not exceed the theoretical max.
+            if np.allclose(mem_steps_np[N-8:], perflog.memory_steps[-1], rtol=1e-6):
+                assert np.alltrue((mem_steps_np-mem0) <= field_step_max)
+            else:  # otherwise, we have a peaky mem usage - make sure exceeding peaks are uncommon (<5% of measurements), and that peaks are less than 2*field_step_max
+                excessive_occurence = np.count_nonzero((mem_steps_np-mem0) > field_step_max)
+                limit = max(1, int(0.05*N))
+                assert excessive_occurence <= limit
+                increases = np.array([(mem_steps_np[i] - mem_steps_np[i - 1]) for i in range(1, mem_steps_np.shape[0])])
+                assert np.alltrue(increases < 2.0*field_step_max)
     assert not mem_exhausted
 
 
@@ -775,16 +806,21 @@ def test_periodic(pset_mode, mode, time_periodic, dt_sign):
     pset = pset_type[pset_mode]['pset'].from_list(fieldset, pclass=MyParticle, lon=[0.5], lat=[0.5], depth=[0.5])
     pset.execute(AdvectionRK4_3D + pset.Kernel(sampleTemp), runtime=delta(hours=51), dt=delta(hours=dt_sign*1))
 
+    p0 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
     if time_periodic is not False:
-        t = pset.time[0]
+        t = p0.time
         temp_theo = temp_func(t)
     elif dt_sign == 1:
         temp_theo = temp_vec[-1]
     elif dt_sign == -1:
         temp_theo = temp_vec[0]
-    assert np.allclose(temp_theo, pset.temp[0], atol=1e-5)
-    assert np.allclose(pset.u1[0], pset.u2[0])
-    assert np.allclose(pset.v1[0], pset.v2[0])
+    assert np.allclose(temp_theo, p0.temp, atol=1e-5)
+    assert np.allclose(p0.u1, p0.u2)
+    assert np.allclose(p0.v1, p0.v2)
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -855,7 +891,7 @@ def test_fieldset_defer_loading_function(pset_mode, zdim, scale_fac, tmpdir, fil
     pset = pset_type[pset_mode]['pset'](fieldset, JITParticle, 0, 0)
 
     def DoNothing(particle, fieldset, time):
-        return ErrorCode.Success
+        return StateCode.Success
 
     pset.execute(DoNothing, dt=3600)
     assert np.allclose(fieldset.U.data, scale_fac*(zdim-1.)/zdim)
@@ -931,10 +967,16 @@ def test_fieldset_from_xarray(pset_mode, tdim):
     pset = pset_type[pset_mode]['pset'](fieldset, JITParticle, 0, 0, depth=20)
 
     pset.execute(AdvectionRK4, dt=1, runtime=10)
+
+    p0 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
     if tdim == 10:
-        assert np.allclose(pset.lon[0], 4.5) and np.allclose(pset.lat[0], 10)
+        assert np.allclose(p0.lon, 4.5) and np.allclose(p0.lat, 10)
     else:
-        assert np.allclose(pset.lon[0], 5.0) and np.allclose(pset.lat[0], 10)
+        assert np.allclose(p0.lon, 5.0) and np.allclose(p0.lat, 10)
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -967,39 +1009,49 @@ def test_fieldset_from_data_gridtypes(pset_mode, xdim=20, ydim=10, zdim=4):
 
     # Rectilinear Z grid
     fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
-    pset = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
-    pset.execute(AdvectionRK4, runtime=1, dt=.5)
-    plon = pset.lon
-    plat = pset.lat
+    pset_rz = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset_rz.execute(AdvectionRK4, runtime=1, dt=.5)
+    plon_rz = pset_rz.lon if pset_mode != 'nodes' else [p.lon for p in pset_rz]
+    plat_rz = pset_rz.lat if pset_mode != 'nodes' else [p.lat for p in pset_rz]
     # sol of  dx/dt = (init_depth+1)*x+0.1; x(0)=0
-    assert np.allclose(plon, [0.17173462592827032, 0.2177736932123214])
-    assert np.allclose(plat, [1, 1])
+    assert np.allclose(plon_rz, [0.17173462592827032, 0.2177736932123214])
+    assert np.allclose(plat_rz, [1, 1])
+    del pset_rz
 
     # Rectilinear S grid
     dimensions['depth'] = depth_s
     fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
-    pset = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
-    pset.execute(AdvectionRK4, runtime=1, dt=.5)
-    assert np.allclose(plon, pset.lon)
-    assert np.allclose(plat, pset.lat)
+    pset_rs = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset_rs.execute(AdvectionRK4, runtime=1, dt=.5)
+    plon_rs = pset_rs.lon if pset_mode != 'nodes' else [p.lon for p in pset_rs]
+    plat_rs = pset_rs.lat if pset_mode != 'nodes' else [p.lat for p in pset_rs]
+    assert np.allclose(plon_rz, plon_rs)
+    assert np.allclose(plat_rz, plat_rs)
+    del pset_rs
 
     # Curvilinear Z grid
     dimensions['lon'] = lonm
     dimensions['lat'] = latm
     dimensions['depth'] = depth
     fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
-    pset = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
-    pset.execute(AdvectionRK4, runtime=1, dt=.5)
-    assert np.allclose(plon, pset.lon)
-    assert np.allclose(plat, pset.lat)
+    pset_cz = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset_cz.execute(AdvectionRK4, runtime=1, dt=.5)
+    plon_cz = pset_cz.lon if pset_mode != 'nodes' else [p.lon for p in pset_cz]
+    plat_cz = pset_cz.lat if pset_mode != 'nodes' else [p.lat for p in pset_cz]
+    assert np.allclose(plon_rz, plon_cz)
+    assert np.allclose(plat_rz, plat_cz)
+    del pset_cz
 
     # Curvilinear S grid
     dimensions['depth'] = depth_s
     fieldset = FieldSet.from_data(data, dimensions, mesh='flat')
-    pset = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
-    pset.execute(AdvectionRK4, runtime=1, dt=.5)
-    assert np.allclose(plon, pset.lon)
-    assert np.allclose(plat, pset.lat)
+    pset_cs = pset_type[pset_mode]['pset'](fieldset, ScipyParticle, [0, 0], [0, 0], [0, .4])
+    pset_cs.execute(AdvectionRK4, runtime=1, dt=.5)
+    plon_cs = pset_cs.lon if pset_mode != 'nodes' else [p.lon for p in pset_cs]
+    plat_cs = pset_cs.lat if pset_mode != 'nodes' else [p.lat for p in pset_cs]
+    assert np.allclose(plon_rz, plon_cs)
+    assert np.allclose(plat_rz, plat_cs)
+    del pset_cs
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -1027,4 +1079,10 @@ def test_deferredload_simplefield(pset_mode, mode, direction, time_extrapolation
 
     runtime = tdim*2 if time_extrapolation else None
     pset.execute(SampleU, dt=direction, runtime=runtime)
-    assert pset.p == tdim-1 if time_extrapolation else tdim-2
+
+    p0 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+    assert p0.p == tdim-1 if time_extrapolation else tdim-2

@@ -1,9 +1,10 @@
+import sys
 import numpy as np
 from abc import ABC
 from abc import abstractmethod
 
 from .iterators import BaseParticleAccessor
-from parcels.particle import ScipyParticle
+from parcels.particle import ScipyParticle, ParticleType
 
 """
 Author: Dr. Christian Kehl
@@ -212,7 +213,7 @@ class Collection(ABC):
         assert type(pcollection) is not type(self)
 
     @abstractmethod
-    def get_multi_by_PyCollection_Particles(self, pycollectionp):
+    def get_multi_by_PyCollection_Particles(self, pycollection_p):
         """
         This function gets particles from this collection, which are themselves in common Python collections, such as
         lists, dicts and numpy structures. We can either directly get the referred Particle instances (for internally-
@@ -222,7 +223,7 @@ class Collection(ABC):
         For collections where get-by-object incurs a performance malus, it is advisable to multi-get particles
         by indices or IDs.
         """
-        assert type(pycollectionp) in [list, dict, np.ndarray], "Trying to get a collection of Particles, but their container is not a valid Python-collection - invalid operation."
+        assert type(pycollection_p) in [list, dict, np.ndarray], "Trying to get a collection of Particles, but their container is not a valid Python-collection - invalid operation."
 
     @abstractmethod
     def get_multi_by_indices(self, indices):
@@ -266,21 +267,58 @@ class Collection(ABC):
         if other is None:
             return
         if type(other) is type(self):
-            self.add_same(other)
+            self.merge_same(other)
         elif isinstance(other, ParticleCollection):
-            self.add_collection(other)
+            self.merge_collection(other)
         else:
             self.add_single(other)
 
     @abstractmethod
-    def add_collection(self, pcollection):
+    def merge_collection(self, pcollection):
         """
-        Adds another, differently structured ParticleCollection to this collection. This is done by, for example,
+        Merges another, differently structured ParticleCollection into this collection. This is done by, for example,
         appending/adding the items of the other collection to this collection.
         """
         assert pcollection is not None, "Trying to add another particle collection to this one, but the other one is None - invalid operation."
         assert isinstance(pcollection, ParticleCollection), "Trying to add another particle collection to this one, but the other is not of the type of 'ParticleCollection' - invalid operation."
         assert type(pcollection) is not type(self)
+
+    @abstractmethod
+    def merge_same(self, same_class):
+        """
+        Merges another, equi-structured ParticleCollection into this collection. This is done by concatenating
+        both collections. The fact that they are of the same ParticleCollection's derivative simplifies
+        parsing and concatenation.
+        """
+        assert same_class is not None, "Trying to add another {} to this one, but the other one is None - invalid operation.".format(type(self))
+        assert type(same_class) is type(self)
+
+    @abstractmethod
+    def add_multiple(self, data_array):
+        """
+        Add multiple particles from an array-like structure (i.e. list or tuple or np.ndarray)
+        to the collection.
+        :arg data_array: one of the following:
+            i) a list or tuples containing multple Particle instances
+            ii) a Numpy.ndarray of dtype = Particle dtype
+            iii) a Numpy.ndarray of shape N x M, with N = # particles and
+                 M = variables [lon, lat, [depth, [time, [dt, [id=-1, [kwargs]]]]]]
+        """
+        is_tuple = False
+        is_list = False
+        is_ptype_ndarray = False
+        is_attr_ndarray = False
+        if data_array is None or len(data_array) <= 0:
+            return
+        if isinstance(data_array, list) and isinstance(data_array[0], ScipyParticle):
+            is_list = True
+        elif isinstance(data_array, tuple) and isinstance(data_array[0], ScipyParticle):
+            is_tuple = True
+        elif isinstance(data_array, np.ndarray) and (isinstance(data_array[0], ScipyParticle) or isinstance(data_array.dtype, ParticleType)):
+            is_ptype_ndarray = True
+        elif isinstance(data_array, dict) and (isinstance(data_array[list(data_array.keys())[0]], np.ndarray)):
+            is_attr_ndarray = True
+        assert is_tuple or is_list or is_ptype_ndarray or is_attr_ndarray
 
     @abstractmethod
     def add_single(self, particle_obj):
@@ -290,15 +328,73 @@ class Collection(ABC):
         """
         assert (isinstance(particle_obj, BaseParticleAccessor) or isinstance(particle_obj, ScipyParticle))
 
+    def split_same(self, subset):
+        """
+        This function splits this collection into two disect equi-structured collections. The reason for it can, for
+        example, be that the set exceeds a pre-defined maximum number of elements, which for performance reasons
+        mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        subset_are_indices = False
+        subset_are_ids = False
+        assert subset is not None
+        assert (subset.shape[0] if isinstance(subset, np.ndarray) else len(subset)) > 0
+        if isinstance(subset, np.ndarray) and (subset.dtype == np.int32 or subset.dtype == np.uint32):
+            subset_are_indices = True
+        elif isinstance(subset, list) and len(subset) > 0 and (isinstance(subset[0], int) or isinstance(subset[0], np.int32) or isinstance(subset[0], np.uint32)):
+            subset_are_indices = True
+        elif isinstance(subset, np.ndarray) and (subset.dtype == np.int64 or subset.dtype == np.uint64):
+            subset_are_ids = True
+        elif isinstance(subset, list) and len(subset) > 0 and (isinstance(subset[0], int) or isinstance(subset[0], np.int64) or isinstance(subset[0], np.uint64)):
+            subset_are_ids = True
+        assert subset_are_ids or subset_are_indices
+        if subset_are_indices:
+            return self.split_by_index(subset)
+        elif subset_are_ids:
+            return self.split_by_id(subset)
+        return None
+
     @abstractmethod
-    def add_same(self, same_class):
+    def split_by_index(self, indices):
         """
-        Adds another, equi-structured ParticleCollection to this collection. This is done by concatenating
-        both collections. The fact that they are of the same ParticleCollection's derivative simplifies
-        parsing and concatenation.
+        This function splits this collection into two disect equi-structured collections using the indices as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
         """
-        assert same_class is not None, "Trying to add another {} to this one, but the other one is None - invalid operation.".format(type(self))
-        assert type(same_class) is type(self)
+        subset_are_indices = False
+        assert indices is not None
+        assert (indices.shape[0] if isinstance(indices, np.ndarray) else len(indices)) > 0
+        if isinstance(indices, np.ndarray) and (indices.dtype == np.int32 or indices.dtype == np.uint32):
+            subset_are_indices = True
+        elif isinstance(indices, list) and len(indices) > 0 and (isinstance(indices[0], int) or isinstance(indices[0], np.int32) or isinstance(indices[0], np.uint32)):
+            subset_are_indices = True
+        assert subset_are_indices
+        return None
+
+    @abstractmethod
+    def split_by_id(self, ids):
+        """
+        This function splits this collection into two disect equi-structured collections using the indices as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        subset_are_ids = False
+        assert ids is not None
+        assert (ids.shape[0] if isinstance(ids, np.ndarray) else len(ids)) > 0
+        if isinstance(ids, np.ndarray) and (ids.dtype == np.int64 or ids.dtype == np.uint64):
+            subset_are_ids = True
+        elif isinstance(ids, list) and len(ids) > 0 and (isinstance(ids[0], int) or isinstance(ids[0], np.int64) or isinstance(ids[0], np.uint64)):
+            subset_are_ids = True
+        assert subset_are_ids
+        return None
 
     @abstractmethod
     def __iadd__(self, same_class):
@@ -531,7 +627,7 @@ class Collection(ABC):
         assert type(pcollection) is not type(self)
 
     @abstractmethod
-    def remove_multi_by_PyCollection_Particles(self, pycollectionp):
+    def remove_multi_by_PyCollection_Particles(self, pycollection_p):
         """
         This function removes particles from this collection, which are themselves in common Python collections, such as
         lists, dicts and numpy structures. In order to perform the removal, we can either directly remove the referred
@@ -541,7 +637,7 @@ class Collection(ABC):
         For collections where removal-by-object incurs a performance malus, it is advisable to multi-remove particles
         by indices or IDs.
         """
-        assert type(pycollectionp) in [list, dict, np.ndarray], "Trying to remove a collection of Particles, but their container is not a valid Python-collection - invalid operation."
+        assert type(pycollection_p) in [list, dict, np.ndarray], "Trying to remove a collection of Particles, but their container is not a valid Python-collection - invalid operation."
 
     @abstractmethod
     def remove_multi_by_indices(self, indices):
@@ -689,7 +785,9 @@ class Collection(ABC):
         quite handy to merge two particle subsets that - due to continuous removal - become too small to be effective.
 
         On the other hand, this function can also internally merge individual particles that are tagged by status as
-        being 'merged' (see the particle status for information on that).
+        being 'merged' (see the particle status for information on that), if :arg same_class is None. This will be done by
+        physically merging particles with the tagged status code 'merge' in this collection, which is to be implemented
+        in the :method ParticleCollection.merge_by_status function (TODO).
 
         In order to distinguish both use cases, we can evaluate the 'same_class' parameter. In cases where this is
         'None', the merge operation semantically refers to an internal merge of individual particles - otherwise,
@@ -700,17 +798,32 @@ class Collection(ABC):
 
         The function shall return the merged ParticleCollection.
         """
-        return None
+        if same_class is None:
+            self.merge_by_status()
+        if type(same_class) is type(self):
+            self.merge_same(same_class)
+        elif isinstance(same_class, ParticleCollection):
+            self.merge_collection(same_class)
 
     @abstractmethod
-    def split(self, indices=None):
+    def merge_by_status(self):
+        """
+        Physically merges particles with the tagged status code 'merge' in this collection (TODO).
+        Operates similar to :method ParticleCollection._clear_deleted_ method.
+        """
+        pass
+
+    @abstractmethod
+    def split(self, subset=None):
         """
         This function splits this collection into two disect equi-structured collections. The reason for it can, for
         example, be that the set exceeds a pre-defined maximum number of elements, which for performance reasons
         mandates a split.
 
-        On the other hand, this function can also internally split individual particles that are tagged byt status as
-        to be 'split' (see the particle status for information on that).
+        On the other hand, this function can also internally split individual particles that are tagged by status as
+        to be 'split' (see the particle status for information on that), if :arg subset is None. This will be done by
+        physically splitting particles with the tagged status code 'split' in this collection, which is to be implemented
+        in the :method ParticleCollection.split_by_status function (TODO).
 
         In order to distinguish both use cases, we can evaluate the 'indices' parameter. In cases where this is
         'None', the split operation semantically refers to an internal split of individual particles - otherwise,
@@ -722,7 +835,20 @@ class Collection(ABC):
         The function shall return the newly created or extended Particle collection, i.e. either the collection that
         results from a collection split or this very collection, containing the newly-split particles.
         """
-        return None
+        result = None
+        if subset is None:
+            result = self.split_by_status()
+        else:
+            result = self.split_same(subset)
+        return result
+
+    @abstractmethod
+    def split_by_status(self):
+        """
+        Physically splits particles with the tagged status code 'split' in this collection (TODO).
+        Operates similar to :method ParticleCollection._clear_deleted_ method.
+        """
+        pass
 
     def __str__(self):
         """
@@ -761,9 +887,9 @@ class Collection(ABC):
 
         sizeof(self) = len(self) * sizeof(pclass)
         """
-        pass
+        return 0
 
-    def empty(self):
+    def isempty(self):
         """
         This function retuns a boolean value, expressing if a collection is emoty (i.e. does not [anymore] contain any
         elements) or not.
@@ -811,6 +937,21 @@ class ParticleCollection(Collection):
         ParticleCollection - Destructor
         """
         pass
+
+    def __sizeof__(self):
+        """
+        This function returns the size in actual bytes required in memory to hold the collection. Ideally and simply,
+        the size is computed as follows:
+
+        sizeof(self) = len(self) * sizeof(pclass)
+        :returns size of this collection in bytes; initiated by calling sys.getsizeof(object)
+        """
+        sz = sys.getsizeof(super(ParticleCollection, self))
+        sz += self._pu_indicators.nbytes if isinstance(self._pu_indicators, np.ndarray) else sys.getsizeof(self._pu_indicators)
+        sz += self._pu_centers.nbytes if isinstance(self._pu_centers, np.ndarray) else sys.getsizeof(self._pu_centers)
+        sz += sys.getsizeof(self._offset)
+        # skip data counting here
+        return sz
 
     @property
     def pu_indicators(self):

@@ -1,20 +1,21 @@
-import sys
 from datetime import timedelta as delta
-from operator import attrgetter  # NOQA
-
-from ctypes import c_void_p
+from operator import attrgetter  # noqa: F401
+from ctypes import c_void_p  # noqa: F401
 
 import numpy as np
+import sys
 
 from parcels.collection.collections import ParticleCollection
 from parcels.collection.iterators import BaseParticleAccessor
 from parcels.collection.iterators import BaseParticleCollectionIterator
 from parcels.collection.iterators import BaseParticleCollectionIterable
-from parcels.particle import ScipyParticle, JITParticle  # noqa
+from parcels.particle import ScipyParticle, JITParticle  # noqa: F401
+from parcels.nodes.PyNode import Node, NodeJIT
+from parcels.nodes.nodelist import DoubleLinkedNodeList
 from parcels.field import Field
-from parcels.tools.loggers import logger
 from parcels.tools.statuscodes import OperationCode
 from scipy.spatial import distance
+from parcels.tools.loggers import logger
 
 try:
     from mpi4py import MPI
@@ -27,15 +28,16 @@ if MPI:
         raise EnvironmentError('sklearn needs to be available if MPI is installed. '
                                'See http://oceanparcels.org/#parallel_install for more information')
 
-__all__ = ['ParticleCollectionAOS', 'ParticleCollectionIterableAOS', 'ParticleCollectionIteratorAOS']
+__all__ = ['ParticleCollectionNodes', 'ParticleCollectionIterableNodes', 'ParticleCollectionIteratorNodes']
 
 
-def _to_write_particles(pd, time):
+def _to_write_particles(begin_node, time):
     """We don't want to write a particle that is not started yet.
     Particle will be written if particle.time is between time-dt/2 and time+dt (/2)
+    :arg begin_node: first node of the node-list, typically: list.begin()
+    :returns list of Particle IDs
     """
-    return [i for i, p in enumerate(pd) if (((time - np.abs(p.dt/2) <= p.time < time + np.abs(p.dt))
-                                             or np.equal(time, p.time)) and np.isfinite(p.id))]
+    return NotImplementedError("ParticleSetNodes::to_write_particles undefined.")
 
 
 def _is_particle_started_yet(particle, time):
@@ -60,11 +62,18 @@ def _convert_to_flat_array(var):
         return np.array(var)
 
 
-class ParticleCollectionAOS(ParticleCollection):
+class ParticleCollectionNodes(ParticleCollection):
     _data_c = None
+    _nclass = None
+    _ngrid = -1
+    _idgen = None
+    _c_lib_register = None
+    _kwarg_keys = None
 
-    def __init__(self, pclass, lon, lat, depth, time, lonlatdepth_dtype, pid_orig, partitions=None, ngrid=1, **kwargs):
+    def __init__(self, idgen, c_lib_register, pclass, lon, lat, depth, time, lonlatdepth_dtype, pid_orig, partitions=None, ngrid=1, **kwargs):
         """
+        :arg idgen: an instance of an ID generator used to obtain unique IDs - mandatory for a node-based collection
+        :arg c_lib_register: an instance of a process-consistent LibraryRegisterC object - mandatory for a node-based collection
         :arg pclass: the Particle class of the objects stored within the nodes
         :arg lon: a non-None list or array of longitudes
         :arg lat: a non-None list or array of latitudes
@@ -76,18 +85,19 @@ class ParticleCollectionAOS(ParticleCollection):
         :arg ngrid: number of grids in the fieldset of the overarching ParticleSet - required for initialising the
         field references of the ctypes-link of particles that are allocated
         """
-
         super(ParticleCollection, self).__init__()
+        self._idgen = idgen
+        self._c_lib_register = c_lib_register
         self._ngrid = ngrid
 
         assert pid_orig is not None, "particle IDs are None - incompatible with the collection. Invalid state."
-        pid = pid_orig + pclass.lastID
+        pid = pid_orig if isinstance(pid_orig, list) or isinstance(pid_orig, np.ndarray) else pid_orig + self._idgen.usable_length
 
         assert depth is not None, "particle's initial depth is None - incompatible with the collection. Invalid state."
         assert lon.size == lat.size and lon.size == depth.size, (
             'lon, lat, depth do not all have the same lenghts')
 
-        assert lon.size == time.size, (
+        assert lon.size == time.size and lon.size == depth.size, (
             'time and positions (lon, lat, depth) do not have the same lengths.')
 
         if partitions is not None and partitions is not False:
@@ -95,9 +105,9 @@ class ParticleCollectionAOS(ParticleCollection):
 
         for kwvar in kwargs:
             assert lon.size == kwargs[kwvar].size, (
-                '%s and positions (lon, lat, depth) do nott have the same lengths.' % kwvar)
+                '%s and positions (lon, lat, depth) do not have the same lengths.' % kwvar)
 
-        offset = np.max(pid) if (pid is not None) and len(pid) > 0 else -1
+        offset = np.max(pid) if (pid is not None) and type(pid) in [list, tuple, np.ndarray] and len(pid) > 0 else -1
         if MPI:
             mpi_comm = MPI.COMM_WORLD
             mpi_rank = mpi_comm.Get_rank()
@@ -113,9 +123,11 @@ class ParticleCollectionAOS(ParticleCollection):
                             coords = np.vstack((lon, lat)).transpose()
                             kmeans = KMeans(n_clusters=mpi_size, random_state=0).fit(coords)
                             self._pu_indicators = kmeans.labels_
+                            self._pu_centers = kmeans.cluster_centers_
                         else:
                             self._pu_indicators = None
                         self._pu_indicators = mpi_comm.bcast(self._pu_indicators, root=0)
+                        self._pu_centers = mpi_comm.bcast(self._pu_centers, root=0)
                     elif np.max(self._pu_indicators) >= mpi_size:
                         raise RuntimeError('Particle partitions must vary between 0 and the number of mpi procs')
                     lon = lon[self._pu_indicators == mpi_rank]
@@ -139,53 +151,74 @@ class ParticleCollectionAOS(ParticleCollection):
         self._pclass = pclass
 
         self._ptype = self._pclass.getPType()
-        self._kwarg_keys = list(kwargs.keys())
-        self._data = np.empty(lon.shape[0], dtype=pclass)
-        initialised = set()
-
         if self._ptype.uses_jit:
-            # Allocate underlying data for C-allocated particles
-            self._data_c = np.empty(lon.shape[0], dtype=self._ptype.dtype)
-
-        self._ncount = self._data.shape[0]
+            self._nclass = NodeJIT
+        else:
+            self._nclass = Node
+        self._kwarg_keys = list(kwargs.keys())
+        self._data = DoubleLinkedNodeList(dtype=self._nclass, c_lib_register=self._c_lib_register)
+        initialised = set()
 
         if lon is not None and lat is not None:
             # Initialise from lists of lon/lat coordinates
-            assert self.ncount == len(lon) and self.ncount == len(lat), (
+            assert len(lon) == len(lat), (
                 'Size of ParticleSet does not match length of lon and lat.')
 
-            for i in range(self.ncount):
-                self._data[i] = pclass(lon[i], lat[i], pid[i], ngrids=ngrid, depth=depth[i], cptr=self.cptr(i), time=time[i])
+            for i in range(len(lon)):
+                init_time = time[i] if time is not None and len(time) > 0 and time[i] is not None else 0
+                pdata_id = None
+                if pid is not None and (isinstance(pid, list) or isinstance(pid, np.ndarray)):
+                    pdata_id = pid[i]
+                else:
+                    pdata_id = idgen.nextID(lon[i], lat[i], depth[i], abs(init_time))
+                pdata = self._pclass(lon[i], lat[i], pid=pdata_id, ngrids=ngrid, depth=depth[i], time=init_time)
                 # Set other Variables if provided
                 for kwvar in kwargs:
                     if isinstance(kwvar, Field):
                         continue
-                    if not hasattr(self._data[i], kwvar):
+                    if not hasattr(pdata, kwvar):
                         raise RuntimeError('Particle class does not have Variable %s' % kwvar)
-                    setattr(self._data[i], kwvar, kwargs[kwvar][i])
+                    setattr(pdata, kwvar, kwargs[kwvar][i])
                     if kwvar not in initialised:
                         initialised.add(kwvar)
+                ndata = self._nclass(id=pdata_id, data=pdata, c_lib_register=self._c_lib_register, idgen=self._idgen)
+                self._data.add(ndata)
 
             initialised |= {'lat', 'lon', 'depth', 'time', 'id'}
 
             for v in self._ptype.variables:
                 if v.name in initialised:
                     continue
-
                 if isinstance(v.initial, Field):
-                    for i in range(self.ncount):
-                        init_time = time[i] if time is not None and len(time) > 0 and np.count_nonzero([tval is not None for tval in time]) == len(time) else 0
+                    i = 0
+                    ndata = self.begin()
+                    while i < len(self._data):
+                        pdata = ndata.data
+                        # ==== ==== ==== #
+                        if (pdata.time is None) or (np.isnan(pdata.time)):
+                            raise RuntimeError('Cannot initialise a Variable with a Field if no time provided (time-type: {} values: {}). Add a "time=" to ParticleSet construction'.format(type(time), time))
+                        init_time = pdata.time if pdata.time not in [None, np.nan] and np.count_nonzero([tval is not None for tval in time]) == len(time) else 0
                         init_field = v.initial
                         init_field.fieldset.computeTimeChunk(init_time, 0)
-                        if (time[i] is None) or (np.isnan(time[i])):
-                            raise RuntimeError('Cannot initialise a Variable with a Field if no time provided (time-type: {} values: {}). Add a "time=" to ParticleSet construction'.format(type(time), time))
-                        setattr(self._data[i], v.name, init_field[init_time, depth[i], lat[i], lon[i]])
+                        setattr(pdata, v.name, init_field[init_time, pdata.depth, pdata.lat, pdata.lon])
                         logger.warning_once("Particle initialisation from field can be very slow as it is computed in scipy mode.")
-
+                        # ==== ==== ==== #
+                        ndata.set_data(pdata)
+                        ndata = ndata.next
+                        i += 1
                 if v not in initialised:
                     initialised.add(v)
         else:
             raise ValueError("Latitude and longitude required for generating ParticleSet")
+
+        self._ncount = len(self._data)
+        # ==== fill c-pointer ==== #
+        if self._ptype.uses_jit:
+            self._data_c = []
+            for i in range(len(self._data)):
+                node = self._data[i]
+                self._data_c.append(node.data.get_cptr())
+
         self._iterator = None
         self._riterator = None
 
@@ -193,17 +226,24 @@ class ParticleCollectionAOS(ParticleCollection):
         """
         Collection - Destructor
         """
-        super().__del__()
+        if self._data is not None and isinstance(self._data, DoubleLinkedNodeList):
+            del self._data
+        self._data = None
+        if self._data_c is not None:
+            del self._data_c
+        self._data_c = None
+        super(ParticleCollectionNodes, self).__del__()
 
     def iterator(self):
         """
         :returns ParticleCollectionIterator, used for a 'for'-loop, in a forward-manner
         """
-        self._iterator = ParticleCollectionIteratorAOS(self)
+        self._iterator = ParticleCollectionIteratorNodes(self)
         return self._iterator
 
     def __iter__(self):
-        """Returns an Iterator that allows for forward iteration over the
+        """
+        Returns an Iterator that allows for forward iteration over the
         elements in the ParticleCollection (e.g. `for p in pset:`).
         """
         return self.iterator()
@@ -212,7 +252,7 @@ class ParticleCollectionAOS(ParticleCollection):
         """
         :returns ParticleCollectionIterator, used for a 'for'-loop, in a backward-manner
         """
-        self._riterator = ParticleCollectionIteratorAOS(self, True)
+        self._riterator = ParticleCollectionIteratorNodes(self, True)
         return self._riterator
 
     def __reversed__(self):
@@ -234,7 +274,7 @@ class ParticleCollectionAOS(ParticleCollection):
     def __getattr__(self, name):
         """
         Access a single property of all particles.
-        CAUTION: this function is not(!) in-place and is quite slow
+        CAUTION: this function is not(!) in-place and is REALLY slow
 
         :arg name: name of the property
         """
@@ -246,8 +286,8 @@ class ParticleCollectionAOS(ParticleCollection):
             return None
         result = np.zeros(self._ncount, dtype=pdtype)
         for index in range(self._ncount):
-            if hasattr(self._data[index], name):
-                result[index] = getattr(self._data[index], name)
+            if hasattr(self._data[index].data, name):
+                result[index] = getattr(self._data[index].data, name)
         return result
 
     @property
@@ -266,28 +306,143 @@ class ParticleCollectionAOS(ParticleCollection):
         return self._data_c
 
     def cptr(self, index):
-        if self._data_c is not None:
-            return self._data_c[index]
-        return None
+        if self._ptype.uses_jit:
+            node = self._data[index]
+            return node.data.get_cptr()
+        else:
+            return None
 
     def isempty(self):
         """
         :returns if the collections is empty or not
         """
-        return len(self._data) == 0
+        return len(self._data) <= 0
+
+    def begin(self):
+        """
+        Returns the begin of the linked particle list (like C++ STL begin() function)
+        :return: begin Node (Node whose prev element is None); returns None if ParticleSet is empty
+        """
+        if not self.isempty():
+            start_index = 0
+            node = self._data[start_index]
+            while not node.isvalid() and start_index < (len(self._data)-1):
+                start_index += 1
+                node = self._data[start_index]
+            while node.prev is not None:
+                # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+                prev_node = node.prev
+                while prev_node is not None and not prev_node.isvalid():
+                    prev_node = prev_node.prev
+                node = prev_node
+            node = None if not node.isvalid() else node
+            return node
+        return None
+
+    def end(self):
+        """
+        Returns the end of the linked partile list. UNLIKE in C++ STL, it returns the last element (valid element),
+        not the element past the last element (invalid element). (see http://www.cplusplus.com/reference/list/list/end/)
+        :return: end Node (Node whose next element is None); returns None if ParticleSet is empty
+        """
+        if not self.isempty():
+            start_index = len(self._data) - 1
+            node = self._data[start_index]
+            while not node.isvalid() and start_index > (-1):
+                start_index -= 1
+                node = self._data[start_index]
+            while node.next is not None:
+                # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+                next_node = node.next
+                while next_node is not None and not next_node.isvalid():
+                    next_node = node.next
+                node = next_node
+            node = None if not node.isvalid() else node
+            return node
+        return None
+
+    def containsID(self, id):
+        """
+        Returns of the collection contains an element with the requested ID.
+        :arg id: ID to be checked if item is contained in the collection
+        :returns boolean, if item is contained or not
+        """
+        result = False
+        ndata = self.begin()
+        while ndata is not None:
+            if not ndata.isvalid():
+                continue
+            pdata = ndata.data
+            result |= (pdata.id == id)
+            ndata = ndata.next
+        return result
+
+    def __repr__(self):
+        result = "\n"
+        node = self.begin()
+        while node.next is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            result += str(node) + "\n"
+            node = node.next
+        result += str(node) + "\n"
+        return result
+
+    def get_index_by_node(self, ndata):
+        """
+        Obtain the index of a node, given the node object.
+        Caution: when deleting objects, this is not always up-to-date because of the delayed garbage collection.
+
+        :arg ndata: Node item to look up in the collection
+        :returns index of the Node to be looked up
+        """
+        index = None
+        try:
+            index = self._data.index(ndata)
+        except ValueError:
+            pass
+        return index
 
     def get_index_by_ID(self, id):
         """
         Provides a simple function to search / get the index for a particle of the requested ID.
-        Returns the particle's index.
+        Returns the particle's index. Divide-and-conquer search of SORTED list - needed because the node list
+        internally can only be scanned for (a) its list index (non-coherent) or (b) a node itself, but not for a
+        specific Node property alone. That is why using the 'bisect' module alone won't work.
 
-        :arg id: search Particle-ID
-        :returns index of the Particle with the ID to be looked up
+        :arg id: search Node ID
+        :returns index of the Node with the ID to be looked up
+
+        Caution: when deleting objects, this is not always up-to-date because of the delayed garbage collection. Hence, it is
+        correct in terms of objects-in-the-list, but it is not correct when only counting VALID particles.
         """
-        super().get_single_by_ID(id)
-        data_ids = np.array([p.id for p in self._data])
-        index = np.where(data_ids == id)[0][0]
-        return index
+        lower = 0
+        upper = len(self._data) - 1
+        pos = lower + int((upper - lower) / 2.0)
+        current_node_data = self._data[pos].data
+        _found = False
+        _search_done = False
+        while current_node_data.id != id and not _search_done:
+            prev_upper = upper
+            prev_lower = lower
+            if id < current_node_data.id:
+                lower = lower
+                upper = pos - 1
+                pos = lower + int((upper - lower) / 2.0)
+            else:
+                lower = pos
+                upper = upper
+                pos = lower + int((upper - lower) / 2.0) + 1
+            if (prev_upper == upper and prev_lower == lower):
+                _search_done = True
+            current_node_data = self._data[pos].data
+        if current_node_data.id == id:
+            _found = True
+        if _found:
+            return pos
+        return None
 
     def get_indices_by_IDs(self, ids):
         """
@@ -297,11 +452,9 @@ class ParticleCollectionAOS(ParticleCollection):
         :arg ids: a vector-list or numpy.ndarray of (64-bit signed or unsigned integer) IDs
         :returns: a vector-list of indices per requested ID
         """
-        data_ids = np.array([p.id for p in self._data])
-        AinB = np.in1d(ids, data_ids)
-        if False in AinB:
-            logger.warning("Did not locate all requested IDs.")
-        indices = np.nonzero(AinB)[0]
+        indices = []
+        for id in ids:
+            indices.append(self.get_index_by_ID(id))
         return indices
 
     def get_single_by_index(self, index):
@@ -312,13 +465,20 @@ class ParticleCollectionAOS(ParticleCollection):
         translation of the collection from a none-indexable, none-random-access structure into an indexable structure.
         In cases where a get-by-index would result in a performance malus, it is highly-advisable to use a different
         get function, e.g. get-by-ID.
+        This function is comparatively slow in contrast to indexable collections.
 
         :arg index: index of the object to be retrieved
         :returns Particle object (SciPy- or JIT) at the indexed location
         """
         super().get_single_by_index(index)
-
-        return self._data[index]
+        result = None
+        if index >= 0 and index < len(self._data):
+            try:
+                if self._data[index] is not None and self._data[index].isvalid():
+                    result = self._data[index].data
+            except ValueError:
+                pass
+        return result
 
     def get_single_by_object(self, particle_obj):
         """
@@ -338,8 +498,33 @@ class ParticleCollectionAOS(ParticleCollection):
         :returns (first) Particle-object (SciPy- or JIT) of the requested particle data
         """
         super().get_single_by_object(particle_obj)
-
-        return self.get_single_by_ID(particle_obj.id)
+        id = particle_obj.id
+        lower = 0
+        upper = len(self._data) - 1
+        pos = lower + int((upper - lower) / 2.0)
+        current_node_data = self._data[pos].data
+        _found = False
+        _search_done = False
+        while current_node_data.id != id and not _search_done:
+            prev_upper = upper
+            prev_lower = lower
+            if id < current_node_data.id:
+                lower = lower
+                upper = pos - 1
+                pos = lower + int((upper - lower) / 2.0)
+            else:
+                lower = pos
+                upper = upper
+                pos = lower + int((upper - lower) / 2.0) + 1
+            if (prev_upper == upper and prev_lower == lower):
+                _search_done = True
+            current_node_data = self._data[pos].data
+        if current_node_data.id == id:
+            _found = True
+        if _found:
+            return current_node_data
+        else:
+            return None
 
     def get_single_by_ID(self, id):
         """
@@ -352,32 +537,92 @@ class ParticleCollectionAOS(ParticleCollection):
         This function uses binary search if we know the ID list to be sorted, and linear search otherwise. We assume
         IDs are unique.
 
-        :arg id: search Particle-ID
+        :arg id: search Node-ID
         :return (first) Particle-object (SciPy- or JIT) attached to ID
         """
         super().get_single_by_ID(id)
+        lower = 0
+        upper = len(self._data) - 1
+        pos = lower + int((upper - lower) / 2.0)
+        current_node_data = self._data[pos].data
+        _found = False
+        _search_done = False
+        while current_node_data.id != id and not _search_done:
+            prev_upper = upper
+            prev_lower = lower
+            if id < current_node_data.id:
+                lower = lower
+                upper = pos - 1
+                pos = lower + int((upper - lower) / 2.0)
+            else:
+                lower = pos
+                upper = upper
+                pos = lower + int((upper - lower) / 2.0) + 1
+            if (prev_upper == upper and prev_lower == lower):
+                _search_done = True
+            current_node_data = self._data[pos].data
+        if current_node_data.id == id:
+            _found = True
+        if _found:
+            return current_node_data
+        return None
 
-        ids = np.array([p.id for p in self._data])
-        index = np.where(ids == id)[0][0]
-        return self.get_single_by_index(index)
+    def get_node_by_ID(self, id):
+        """
+        divide-and-conquer search of SORTED list - needed because the node list internally
+        can only be scanned for (a) its list index (non-coherent) or (b) a node itself, but not for a specific
+        Node property alone. That is why using the 'bisect' module alone won't work.
+        :arg id: search Node ID
+        :return: Node attached to ID - if node not in list: return None
+        """
+        lower = 0
+        upper = len(self._data) - 1
+        pos = lower + int((upper - lower) / 2.0)
+        current_node = self._data[pos]
+        _found = False
+        _search_done = False
+        while current_node.data.id != id and not _search_done:
+            prev_upper = upper
+            prev_lower = lower
+            if id < current_node.data.id:
+                lower = lower
+                upper = pos - 1
+                pos = lower + int((upper - lower) / 2.0)
+            else:
+                lower = pos
+                upper = upper
+                pos = lower + int((upper - lower) / 2.0) + 1
+            if (prev_upper == upper and prev_lower == lower):
+                _search_done = True
+            current_node = self._data[pos]
+        if current_node.data.id == id:
+            _found = True
+        if _found:
+            return current_node
+        else:
+            return None
 
     def get_same(self, same_class):
         """
         This function gets particles from this collection that are themselves stored in another object of an equi-
         structured ParticleCollection.
 
-        :arg same_class: a ParticleCollectionAOS object with a subsample of Particles in this collection
+        :arg same_class: a ParticleCollectionNodes object with a subsample of Nodes in this collection
         :returns list of Particle-objects (SciPy- or JIT) of the requested subset-collection
         """
         super().get_same(same_class)
         results = []
-        for item in same_class:
-            index = np.where(self._data == item)[0]  # this will require implementing an equals(...) function to check between Particle and BaseParticleAccessor
-            if index.size != 0:
-                index = index[0]
-                results.append(self._data[index])
-        if len(results) == 0:
-            results = None
+        other_node = same_class.begin()
+        this_node = self.begin()
+        while (other_node is not None) and (this_node is not None):
+            if this_node.data.id < other_node.data.id:
+                this_node = this_node.next
+                continue
+            if other_node.data.id < this_node.data.id:
+                other_node = other_node.next
+                continue
+            if this_node.data.id == other_node.data.id:
+                results.append(this_node.data)
         return results
 
     def get_collection(self, pcollection):
@@ -386,20 +631,18 @@ class ParticleCollectionAOS(ParticleCollection):
         is differently structured than this one. That means the other-collection has to be re-formatted first in an
         intermediary format.
 
-        :arg pcollection: a ParticleCollection object (i.e. derived from BaseParticleCollection) with a subsample of Particles in this collection
+        :arg pcollection: a ParticleCollection object (i.e. derived from BaseParticleCollection) with a subsample of Nodes in this collection
         :returns list of Particle-objects (SciPy- or JIT) of the requested subset-collection
         """
         super().get_collection(pcollection)
-        if self._ncount <= 0:
+        if (self._ncount <= 0) or (len(pcollection) <= 0):
             return None
-        ngrids = len(getattr(self._data[0], 'xi'))
         results = []
         for item in pcollection:
-            pdata_item = self._pclass(lon=item.lon, lat=item.lat, pid=item.pid, ngrids=ngrids, depth=item.depth, time=item.time)
-            index = np.where(self._data == pdata_item)[0]  # this will require implementing and equals(...) function check between Particle and BaseParticleAccessor
-            if index.size != 0:
-                index = index[0]
-                results.append(self._data[index])
+            # here, we really need a 'contains_ID' function
+            node = self.get_node_by_ID(item.id)
+            if node is not None:
+                results.append(node)
         if len(results) == 0:
             results = None
         return results
@@ -414,16 +657,20 @@ class ParticleCollectionAOS(ParticleCollection):
         For collections where get-by-object incurs a performance malus, it is advisable to multi-get particles
         by indices or IDs.
 
-        :arg pycollection_p: a Python-internal collection object (e.g. a tuple or list), filled with reference particles (SciPy- or JIT)
-        :returns a vector-list of the requested particles
+        :arg a Python-internal collection object (e.g. a tuple or list), filled with reference particles (SciPy- or JIT)
+        :returns a vector-list of Nodes that contain the requested particles
         """
         super().get_multi_by_PyCollection_Particles(pycollection_p)
-        np_collection_p = np.array(pycollection_p, dtype=self._pclass)
-        indices = np.in1d(np_collection_p, self._data).nonzero()[0]
-        result = self._data[indices]
-        if result.shape[0] <= 0:
-            result = None
-        return result
+        if (self._ncount <= 0) or (len(pycollection_p) <= 0):
+            return None
+        results = []
+        for item in pycollection_p:
+            node = self.get_node_by_ID(item.id)
+            if node is not None:
+                results.append(node)
+        if len(results) == 0:
+            results = None
+        return results
 
     def get_multi_by_indices(self, indices):
         """
@@ -432,12 +679,17 @@ class ParticleCollectionAOS(ParticleCollection):
         shall rather use a get-via-object-reference strategy.
 
         :param indices: requested indices
-        :returns vector-list of Particle objects
+        :returns vector-list of Node objects
         """
         super().get_multi_by_indices(indices)
+        results = []
         if type(indices) is dict:
             indices = list(indices.values())
-        return self._data[indices]
+        for index in indices:
+            res = self.get_single_by_index(index)
+            if res is not None:
+                results.append(res)
+        return results
 
     def get_multi_by_IDs(self, ids):
         """
@@ -452,29 +704,23 @@ class ParticleCollectionAOS(ParticleCollection):
         in the look-up. The collection maintains a `sorted` flag to indicate whether this assumption holds.
 
         :arg ids: requested IDs of particles
-        :returns vector-list of Particle objects
+        :returns vector-list of Node objects
         """
         super().get_multi_by_IDs(ids)
+        results = []
         if type(ids) is dict:
             ids = list(ids.values())
-
-        if len(ids) == 0:
-            return None
-
-        data_ids = np.array([p.id for p in self._data])
-        indices = np.in1d(ids, data_ids)
-        items_found = indices
-        indices = np.nonzero(indices)[0]
-        if False in items_found:
-            logger.warn("Failed to located a requested Particle")
-        if len(indices) <= 0:
-            indices = None
-        return self.get_multi_by_indices(indices)
+        for id in ids:
+            res = self.get_single_by_ID(id)
+            if res is not None:
+                results.append(res)
+        return results
 
     def merge_collection(self, pcollection):
         """
         Merges another, differently structured ParticleCollection into this collection. This is done by, for example,
-        appending/adding the items of the other collection to this collection.
+        appending/adding the items of the other collection to this collection. Note that a merge means that particles
+        in the original collection are removed, hence after the merge, :arg pcollection is empty.
 
         this is the former "add(pcollection)" function.
         :arg pcollection: second ParticleCollection object to be merged into this collection
@@ -482,54 +728,34 @@ class ParticleCollectionAOS(ParticleCollection):
         """
         # ==== first approach - still need to incorporate the MPI re-centering ==== #
         super().merge_collection(pcollection)
-        ngrids = 0
-        if self._ncount > 0:
-            ngrids = self._ngrid
-        elif len(pcollection) > 0:
-            pd0 = pcollection[0]
-            ngrids = len(pd0['xi'])
-        pd_cdata = None
-        if self._ptype.uses_jit:
-            pd_cdata = np.array(len(pcollection), dtype=self._ptype.dtype)
         results = []
         for item_index, item in enumerate(pcollection):
-            pdata_item = self._pclass(lon=item.lon, lat=item.lat, pid=item.pid, ngrids=ngrids, depth=item.depth, time=item.time, cptr=pd_cdata[item_index])
-            results.append(pdata_item)
-        self._data = np.concatenate([self._data, np.array(results, dtype=self._pclass)])
-        if self._ptype.uses_jit:
-            self._data_c = np.concatenate([self._data_c, pd_cdata])
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+            pdata_item = self._pclass(lon=item.lon, lat=item.lat, pid=item.pid, ngrids=self._ngrid, depth=item.depth, time=item.time)
+            results.append(self.add_single(pdata_item))
+        pcollection.clear()
+        self._ncount = len(self._data)
         return results
 
     def merge_same(self, same_class):
         """
         Merges another, equi-structured ParticleCollection into this collection. This is done by concatenating
         both collections. The fact that they are of the same ParticleCollection's derivative simplifies
-        parsing and concatenation.
+        parsing and concatenation. Note that a merge means that particles in the original collection are removed,
+        hence after the merge, :arg pcollection is empty.
 
         this is the former "add(same_class)" function.
-        :arg same_class: second ParticleCollectionAOS object to be merged into this collection
+        :arg pcollection: second ParticleCollectionNodes object to be merged into this collection
         :returns vector-list of indices of all merged particles
         """
-        super().merge_same(same_class)
+        super(ParticleCollectionNodes, self).merge_same(same_class)
+        results = []
         if same_class.ncount <= 0:
             return
 
-        if self._ncount <= 0:
-            self._data = same_class._data
-            if same_class.ptype.uses_jit and self._ptype.uses_jit:
-                self._data_c = same_class._data_c
-            self._ncount = same_class.ncount
-            return
-
-        self._data = np.concatenate([self._data, same_class.data])
-        if self._ptype.uses_jit:
-            self._data_c = np.concatenate([self._data_c, same_class.data_c])
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+        for i in range(len(same_class)):
+            pdata = same_class.get_single_by_index(i)  # get() returns the particle data, pop() returns the node
+            results.append(self.add_single(pdata))
+        return results
 
     def add_multiple(self, data_array):
         """
@@ -554,7 +780,6 @@ class ParticleCollectionAOS(ParticleCollection):
                 pdata = data_array[i]
                 results.append(self.add_single(pdata))
         elif isinstance(data_array, dict) and isinstance(data_array['lon'], np.ndarray):
-            pu_ids = None
             pu_indices = None
             n_pu_data = 0
             if MPI and MPI.COMM_WORLD.Get_size() > 1:
@@ -570,14 +795,6 @@ class ParticleCollectionAOS(ParticleCollection):
                 min_pu = mpi_comm.bcast(min_pu, root=0)
                 self._pu_indicators = mpi_comm.bcast(self._pu_indicators, root=0)
                 pu_indices = np.nonzero(min_pu == mpi_rank)[0]
-                ids = np.arange(ScipyParticle.lastID, stop=ScipyParticle.lastID+data_array['lon'].shape[0]) if 'id' not in data_array.keys() else data_array['id']
-                mpi_comm.Bcast(ids, root=0)
-                pu_ids = ids
-                new_lastID = 0
-                if mpi_rank == 0:
-                    new_lastID = ScipyParticle.lastID+data_array['lon'].shape[0]-1
-                new_lastID = mpi_comm.bcast(new_lastID, root=0)
-                self._pclass.setLastID(new_lastID)
                 pu_center = np.array(np.mean(spdata, axis=0), dtype=self._lonlatdepth_dtype)
                 n_pu_data = pu_indices.shape[0]
                 pu_ncenters = None
@@ -591,17 +808,13 @@ class ParticleCollectionAOS(ParticleCollection):
                         self._pu_centers[i, :] += ax*pu_ncenters[i, :]
                 mpi_comm.Bcast(self._pu_centers, root=0)
             else:
-                pu_ids = np.arange(ScipyParticle.lastID, stop=ScipyParticle.lastID+data_array['lon'].shape[0]) if 'id' not in data_array.keys() else data_array['id']
-                new_lastID = ScipyParticle.lastID+data_array['lon'].shape[0]-1
-                self._pclass.setLastID(new_lastID)
                 pu_indices = np.arange(start=0, stop=data_array['lon'].shape[0])
                 n_pu_data = pu_indices.shape[0]
             if n_pu_data <= 0:
                 results = []
             else:
                 for i in pu_indices:
-                    pid = pu_ids[i]
-                    pdata = self._pclass(lon=data_array['lon'][i], lat=data_array['lat'][i], pid=pid, ngrids=self._ngrid)
+                    pdata = self._pclass(lon=data_array['lon'][i], lat=data_array['lat'][i], pid=np.iinfo(np.int64).max, ngrids=self._ngrid)
                     if 'depth' in data_array.keys():
                         pdata.depth = data_array['depth'][i]
                     if 'time' in data_array.keys():
@@ -617,7 +830,7 @@ class ParticleCollectionAOS(ParticleCollection):
 
     def add_single(self, particle_obj, pu_checked=False):
         """
-        Adding a single Particle to the collection - either as a 'Particle; object in parcels itself, or
+        Adding a single Particle to the collection - either as a 'Particle' object in parcels itself, or
         via its ParticleAccessor.
         :returns index of added particle
         """
@@ -637,6 +850,8 @@ class ParticleCollectionAOS(ParticleCollection):
                 spdata = None
                 if mpi_size > 1 and mpi_rank == 0:
                     ppos = particle_obj
+                    if isinstance(particle_obj, self._nclass):
+                        ppos = particle_obj.data
                     spdata = np.array([ppos.lat, ppos.lon], dtype=self._lonlatdepth_dtype)
                     n_clusters = self._pu_centers.shape[0]
                     for i in range(n_clusters):
@@ -648,14 +863,6 @@ class ParticleCollectionAOS(ParticleCollection):
                     self._pu_indicators = np.concatenate((self._pu_indicators, min_pu), axis=0)
                 min_pu = mpi_comm.bcast(min_pu, root=0)
                 self._pu_indicators = mpi_comm.bcast(self._pu_indicators, root=0)
-                pu_id = particle_obj.id
-                if particle_obj.id >= np.iinfo(np.uint64).max:
-                    pu_id = ScipyParticle.lastID
-                    new_lastID = 0
-                    if mpi_rank == 0:
-                        new_lastID = ScipyParticle.lastID + 1
-                    new_lastID = mpi_comm.bcast(new_lastID, root=0)
-                    self._pclass.setLastID(new_lastID)
                 if mpi_rank == 0:
                     ax = 1.0 / float(len(np.nonzero(self._pu_indicators == min_pu)[0]))
                     self._pu_centers[min_pu, :] += ax * spdata
@@ -665,24 +872,26 @@ class ParticleCollectionAOS(ParticleCollection):
                     _add_to_pu = True
                 else:
                     _add_to_pu = False
-            else:
-                pu_id = particle_obj.id
-                if particle_obj.id >= np.iinfo(np.uint64).max:
-                    pu_id = ScipyParticle.lastID
-                    self._pclass.setLastID(ScipyParticle.lastID + 1)
-        else:
-            pu_id = particle_obj.id
-            if particle_obj.id >= np.iinfo(np.uint64).max:
-                pu_id = ScipyParticle.lastID
-                self._pclass.setLastID(ScipyParticle.lastID + 1)
         if _add_to_pu:
-            particle_obj.id = pu_id
-            self._data = np.concatenate((self._data, [particle_obj, ]), axis=0)
-            index = self._data.shape[0]-1
-            if self._ptype.uses_jit and isinstance(particle_obj, JITParticle):
-                self._data_c = np.concatenate((self._data_c, [particle_obj.get_cptr(), ]))
+            index = -1
+            pid = np.iinfo(np.uint64).max
+            poid = particle_obj.data.id if isinstance(particle_obj, self._nclass) \
+                else (particle_obj.id if isinstance(particle_obj, ScipyParticle) else np.iinfo(np.uint64).max)
+            if (poid == pid) or (poid in [np.iinfo(np.uint64).max, np.iinfo(np.int64).max]) or isinstance(particle_obj, ScipyParticle):
+                pid = self._idgen.nextID(particle_obj.lon, particle_obj.lat, particle_obj.depth, particle_obj.time)
+                if isinstance(particle_obj, self._nclass):
+                    particle_obj.data.id = pid
+                elif isinstance(particle_obj, ScipyParticle):
+                    particle_obj.id = pid
+            if isinstance(particle_obj, self._nclass):
+                self._data.add(particle_obj)
+                index = self._data.bisect_right(particle_obj)
+            else:
+                node = self._nclass(data=particle_obj, c_lib_register=self._c_lib_register, idgen=self._idgen)
+                self._data.add(node)
+                index = self._data.bisect_right(node)
             if index >= 0:
-                self._ncount = self._data.shape[0]
+                self._ncount = len(self._data)
                 return index
         self._ncount = len(self._data)
         return None
@@ -693,21 +902,20 @@ class ParticleCollectionAOS(ParticleCollection):
         The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
         performance reasons mandates a split.
 
-        The function shall return the newly created or extended Particle collection, i.e. either the collection that
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
         results from a collection split or this very collection, containing the newly-split particles.
 
         :arg indices: requested indices to be split off this collection
-        :returns new ParticleCollectionAOS with the split-off particles
+        :returns new ParticleCollectionNodes with the split-off (nodes of) particles
         """
         super().split_by_index(indices)
         assert len(self._data) > 0
-        result = ParticleCollectionAOS(self._idgen, self._c_lib_register, self._pclass, lon=np.empty(shape=0), lat=np.empty(shape=0), depth=np.empty(shape=0), time=np.empty(shape=0), pid_orig=None, lonlatdepth_dtype=self._lonlatdepth_dtype, ngrid=self._ngrid)
-        idx = sorted(indices, reverse=True)
-        tmp = []
-        for index in idx:  # pop-based process needs to start from the back of the queue
-            pdata = self.pop_single_by_index(index=index)
-            tmp.append(pdata)
-        for pdata in reversed(tmp):  # add particles in correct order again
+        result = ParticleCollectionNodes(self._idgen, self._c_lib_register, self._pclass, lon=np.empty(shape=0), lat=np.empty(shape=0), depth=np.empty(shape=0), time=np.empty(shape=0), pid_orig=None, lonlatdepth_dtype=self._lonlatdepth_dtype, ngrid=self._ngrid)
+        for index in sorted(indices, reverse=True):  # pop-based process needs to start from the back of the queue
+            ndata = self.pop_single_by_index(index=index)
+            pdata = ndata.data
+            ndata.set_data(None)
+            del ndata
             result.add_single(pdata)
         return result
 
@@ -717,17 +925,20 @@ class ParticleCollectionAOS(ParticleCollection):
         The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
         performance reasons mandates a split.
 
-        The function shall return the newly created or extended Particle collection, i.e. either the collection that
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
         results from a collection split or this very collection, containing the newly-split particles.
 
         :arg IDs: requested IDs to be split off this collection
-        :returns new ParticleCollectionAOS with the split-off particles
+        :returns new ParticleCollectionNodes with the split-off (nodes of) particles
         """
         super().split_by_id(ids)
         assert len(self._data) > 0
-        result = ParticleCollectionAOS(self._idgen, self._c_lib_register, self._pclass, lon=np.empty(shape=0), lat=np.empty(shape=0), depth=np.empty(shape=0), time=np.empty(shape=0), pid_orig=None, lonlatdepth_dtype=self._lonlatdepth_dtype, ngrid=self._ngrid)
+        result = ParticleCollectionNodes(self._idgen, self._c_lib_register, self._pclass, lon=np.empty(shape=0), lat=np.empty(shape=0), depth=np.empty(shape=0), time=np.empty(shape=0), pid_orig=None, lonlatdepth_dtype=self._lonlatdepth_dtype, ngrid=self._ngrid)
         for id in ids:
-            pdata = self.pop_single_by_ID(id)
+            ndata = self.pop_single_by_ID(id)
+            pdata = ndata.data
+            ndata.set_data(None)
+            del ndata
             result.add_single(pdata)
         return result
 
@@ -740,7 +951,8 @@ class ParticleCollectionAOS(ParticleCollection):
         with 'a' and 'b' begin the two equi-structured objects (or: 'b' being and individual object).
         This operation is equal to an in-place addition of (an) element(s).
 
-        :arg same_class: second ParticleCollectionAOS object to be merged into this collection
+        this is the former "add(same_class)" function.
+        :arg pcollection: second ParticleCollectionNodes object to be merged into this collection
         :returns vector-list of indices of all merged particles
         """
         self.merge_same(same_class)
@@ -758,24 +970,10 @@ class ParticleCollectionAOS(ParticleCollection):
 
         insert(obj) -> add_single(obj)
 
-        For AoS, insert with 'index==None', the function equates to 'add'. If 'index' is specified, split the array,
-        insert the item and splice the arrays.
+        This collection does not evaluate the index, as it is not an indexable collection.
         :arg obj: Particle object to insert
         """
-        if index is None:
-            self.add_single(obj)
-        else:
-            assert isinstance(obj, ScipyParticle)
-            top_array = self._data[0:index-1]
-            bottom_array = self._data[index:]
-            splice_array = np.concatenate([top_array, obj])
-            self._data = np.concatenate([splice_array, bottom_array])
-            if self._ptype.uses_jit and isinstance(obj, JITParticle):
-                top_array = self._data_c[0:index-1]
-                bottom_array = self._data_c[index:]
-                splice_array = np.concatenate((top_array, [obj.get_cptr(), ]))
-                self._data_c = np.concatenate([splice_array, bottom_array])
-            self._ncount = self._data.shape[0]
+        return self.add_single(obj)
 
     def push(self, particle_obj):
         """
@@ -793,9 +991,7 @@ class ParticleCollectionAOS(ParticleCollection):
         :arg particle_obj: Particle object to push
         :returns index, i.e. position of the new element
         """
-        return_index = self._ncount
-        self.add_single(particle_obj)
-        return return_index
+        return self.add_single(particle_obj)
 
     def append(self, particle_obj):
         """
@@ -835,8 +1031,12 @@ class ParticleCollectionAOS(ParticleCollection):
         :arg index: index of the Particle to be set to the deleted state
         """
         super().delete_by_index(index)
-        p = self.get_single_by_index(index)
-        p.state = OperationCode.Delete
+        if index >= 0 and index < len(self._data):
+            try:
+                if self._data[index] is not None and self._data[index].isvalid():
+                    self._data[index].data.state = OperationCode.Delete
+            except ValueError:
+                pass
 
     def delete_by_ID(self, id):
         """
@@ -849,7 +1049,9 @@ class ParticleCollectionAOS(ParticleCollection):
         """
         super().delete_by_ID(id)
         index = self.get_index_by_ID(id)
-        self.delete_by_index(index)
+        pdata = self._data[index].data
+        pdata.state = OperationCode.Delete
+        self._data[index].set_data(pdata)
 
     def remove_single_by_index(self, index):
         """
@@ -860,17 +1062,12 @@ class ParticleCollectionAOS(ParticleCollection):
         and then perform the removal.
         In cases where a removal-by-index would result in a performance malus, it is highly-advisable to use a different
         removal functions, e.g. remove-by-object or remove-by-ID.
-        :arg index: index of the Particle to be removed from the collection
+        :arg index: index of the Node to be removed from the collection
         """
         super().remove_single_by_index(index)
-        result = self.get_single_by_index(index)
-        self._data = np.delete(self._data, index)
-        if self.ptype.uses_jit:
-            self._data_c = np.delete(self._data_c, index)
-            # Update C-pointer on particles
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount -= 1
+        result = self._data[index].data
+        self._data[index].unlink()
+        del self._data[index]
         return result
 
     def remove_single_by_object(self, particle_obj):
@@ -881,14 +1078,40 @@ class ParticleCollectionAOS(ParticleCollection):
         perform the removal - which results in a significant performance malus.
         In cases where a removal-by-object would result in a performance malus, it is highly-advisable to use a different
         removal functions, e.g. remove-by-index or remove-by-ID.
-        :arg particle_obj: Particle object that is to be removed from the collection
+        :arg particle_obj: Particle object of the Node that is to be removed from the collection
         """
         super().remove_single_by_object(particle_obj)
 
-        # We cannot look for the object directly, so we will look for one of
-        # its properties that has the nice property of being stored in an
-        # ordered list
-        return self.remove_single_by_ID(particle_obj.id)
+        node = self.begin()
+        result = None
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            result = node.data
+            next_node = node.next
+            if node.data == particle_obj:
+                node.unlink()
+                self._data.remove(node)
+                break
+            node = next_node
+        self._ncount = len(self._data)
+        return result
+
+    def remove_single_by_node(self, ndata):
+        """
+        This function removes a node from the collection based on the (expected) node itself.
+        :return boolean indicator if item has been located (and deleted) or not
+        :arg ndata: Node that is to be removed from the collection
+        """
+        result = True
+        try:
+            ndata.unlink()
+            self._data.remove(ndata)
+        except ValueError:
+            result = False
+        return result
 
     def remove_single_by_ID(self, id):
         """
@@ -901,8 +1124,23 @@ class ParticleCollectionAOS(ParticleCollection):
         :arg id: Particle ID of the object to be removed from the collection
         """
         super().remove_single_by_ID(id)
-        index = self.get_index_by_ID(id)
-        return self.remove_single_by_index(index)
+
+        node = self.begin()
+        result = None
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            result = node.data
+            next_node = node.next
+            if node.data.id == id:
+                node.unlink()
+                self._data.remove(node)
+                break
+            node = next_node
+        self._ncount = len(self._data)
+        return result
 
     def remove_same(self, same_class):
         """
@@ -910,19 +1148,23 @@ class ParticleCollectionAOS(ParticleCollection):
         structured ParticleCollection. As the structures of both collections are the same, a more efficient M-in-N
         removal can be applied without an in-between reformatting.
 
-        :arg same_class: a ParticleCollectionAOS object, containing Nodes that are to be removed from this collection
+        :arg same_class: a ParticleCollectionNodes object, containing Nodes that are to be removed from this collection
         """
         super().remove_same(same_class)
-        indices = []
-        indices = np.in1d(same_class.data, self._data)
-        indices = None if len(indices) == 0 else np.nonzero(indices)[0]
-
-        self._data = np.delete(self._data, indices)
-        if self.ptype.uses_jit:
-            self._data_c = np.delete(self._data_c, indices)
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+        other_node = same_class.begin()
+        this_node = self.begin()
+        while this_node is not None and other_node is not None:
+            if this_node.data.id < other_node.data.id:
+                this_node = this_node.next
+                continue
+            if other_node.data.id < this_node.data.id:
+                other_node = other_node.next
+                continue
+            next_node = this_node.next
+            if this_node.data.id == other_node.data.id:
+                this_node.unlink()
+                self._data.remove(this_node)
+            this_node = next_node
 
     def remove_collection(self, pcollection):
         """
@@ -931,23 +1173,18 @@ class ParticleCollectionAOS(ParticleCollection):
         formatted in an intermediary format, before executing the removal.
         That said, this method should still be at least as efficient as a removal via common Python collections (i.e.
         lists, dicts, numpy's nD arrays & dense arrays). Despite this, due to the reformatting, in some cases it may
-        be more efficient to remove items then rather by IDs oder indices.
+        be more efficient to remove items rather by IDs or indices.
 
         :arg pcollection: a BaseParticleCollection object, containing Particle objects that are to be removed from this collection
         """
         super().remove_collection(pcollection)
-
         ids = [p.id for p in pcollection]
-        data_ids = [p.id for p in self._data]
-        indices = np.in1d(ids, data_ids)
+        data_ids = [n.data.id for n in self._data if n.isvalid()]
+        indices = np.in1d(data_ids, ids)
         indices = None if len(indices) == 0 else np.nonzero(indices)[0]
-
-        self._data = np.delete(self._data, indices)
-        if self.ptype.uses_jit:
-            self._data_c = np.delete(self._data_c, indices)
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+        if indices is not None:
+            mutual_ids = data_ids[indices]
+            self.remove_multi_by_IDs(mutual_ids)
 
     def remove_multi_by_PyCollection_Particles(self, pycollection_p):
         """
@@ -957,43 +1194,41 @@ class ParticleCollectionAOS(ParticleCollection):
         each instance for its index (for random-access structures), which results in a considerable performance malus.
 
         For collections where removal-by-object incurs a performance malus, it is advisable to multi-remove particles
-        by indices.
+        by IDs.
 
         :arg pycollection_p: a Python-based collection (i.e. a tuple or list), containing Particle objects that are to
                             be removed from this collection.
         """
         super().remove_multi_by_PyCollection_Particles(pycollection_p)
-        npcollectionp = np.array(pycollection_p, dtype=self._pclass)
-        npindices = np.in1d(npcollectionp, self._data)
-        indices = None if len(npindices) == 0 else np.nonzero(npindices)[0]
-        if indices is None:
-            return
-
-        self._data = np.delete(self._data, indices)
-        if self.ptype.uses_jit:
-            self._data_c = np.delete(self._data_c, indices)
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+        ids = [p.id for p in pycollection_p]
+        data_ids = [n.data.id for n in self._data if n.isvalid()]
+        indices = np.in1d(data_ids, ids)
+        indices = None if len(indices) == 0 else np.nonzero(indices)[0]
+        if indices is not None:
+            mutual_ids = data_ids[indices]
+            self.remove_multi_by_IDs(mutual_ids)
 
     def remove_multi_by_indices(self, indices):
         """
         This function removes particles from this collection based on their indices. This works best for random-access
         collections (e.g. numpy's ndarrays, dense matrices and dense arrays), whereas internally ordered collections
-        shall rather use a removal-via-object-reference strategy.
+        shall rather use a removal-via-object-reference strategy. Note that an index-based removal in this ordered collection
+        is a slow process.
 
         :arg indices: a list or np.ndarray of indices that are to be removed from this collection.
         """
         super().remove_multi_by_indices(indices)
         if type(indices) is dict:
             indices = list(indices.values())
+        if type(indices) is np.ndarray:
+            indices = indices.tolist()
 
-        self._data = np.delete(self._data, indices)
-        if self.ptype.uses_jit:
-            self._data_c = np.delete(self._data_c, indices)
-            for p, pdata in zip(self._data, self._data_c):
-                p._cptr = pdata
-        self._ncount = self._data.shape[0]
+        if len(indices) > 0:
+            indices.sort(reverse=True)
+            for index in indices:
+                self._data[index].unlink()
+                del self._data[index]
+        self._ncount = len(self._data)
 
     def remove_multi_by_IDs(self, ids):
         """
@@ -1010,11 +1245,24 @@ class ParticleCollectionAOS(ParticleCollection):
         if len(ids) == 0:
             return
 
-        # Use binary search if the collection is sorted, linear search otherwise
-        data_ids = [p.id for p in self._data]
-        indices = np.in1d(ids, data_ids)
-        indices = None if len(indices) == 0 else np.nonzero(indices)[0]
-        self.remove_multi_by_indices(indices)
+        node = self.begin()
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            next_node = node.next
+            if node.data.id in ids:
+                node.unlink()
+                self._data.remove(node)
+            node = next_node
+        self._ncount = len(self._data)
+
+    def remove_deleted(self):
+        """
+        This function physically removes Particle objects from this collection that are marked to be removed by their state.
+        """
+        self._clear_deleted_()
 
     def __isub__(self, other):
         """
@@ -1031,8 +1279,12 @@ class ParticleCollectionAOS(ParticleCollection):
             return
         if type(other) is type(self):
             self.remove_same(other)
+        elif isinstance(other, ParticleCollection):
+            self.remove_collection(other)
         elif isinstance(other, ScipyParticle):
             self.remove_single_by_object(other)
+        elif isinstance(other, Node):
+            self.remove_single_by_node(other)
         else:
             raise TypeError("Trying to do an incremental removal of an element of type %s, which is not supported." % type(other))
         return self
@@ -1049,18 +1301,22 @@ class ParticleCollectionAOS(ParticleCollection):
         :returns last Node (if index == -1), indexed Node (if 0 < index < len(collection)) or None (if no Node can be retrieved)
         """
         super().pop_single_by_index(index)
-        return self.remove_single_by_index(index)
+        self._ncount -= 1
+        return self._data.pop(index)
 
     def pop_single_by_ID(self, id):
         """
         Searches for Particle with ID 'id', removes that Particle from the Collection and returns that Particle (or: ParticleAccessor).
         If Particle cannot be retrieved (e.g. because the ID is not available), returns None.
 
-        :arg id: 64-bit (signed or unsigned) integer ID of the Particle object to be popped (i.e. retrieved and removed) from this collections
-        :returns identified Particle (if ID is related or an object contained in this collection) or None (if no Particle can be retrieved)
+        :arg id: 64-bit (signed or unsigned) integer ID of the Node to be popped (i.e. retrieved and removed) from this collections
+        :returns identified Node (if ID is related or an object contained in this collection) or None (if no Node can be retrieved)
         """
         super().pop_single_by_ID(id)
-        return self.remove_single_by_ID(id)
+        node = self.get_node_by_ID(id)
+        index = self._data.bisect_left(node)
+        self._ncount -= 1
+        return self._data.pop(index)
 
     def pop_multi_by_indices(self, indices):
         """
@@ -1075,8 +1331,10 @@ class ParticleCollectionAOS(ParticleCollection):
         :returns a list of retrieved Nodes
         """
         super().pop_multi_by_indices(indices)
-        results = self._data[indices]
-        self.remove_multi_by_indices(indices)
+        results = []
+        for index in indices:
+            results.append(self.pop_single_by_index(index))
+            self._ncount -= 1
         return results
 
     def pop_multi_by_IDs(self, ids):
@@ -1084,32 +1342,37 @@ class ParticleCollectionAOS(ParticleCollection):
         Searches for Particles with the IDs registered in 'ids', removes the Particles from the Collection and returns the Particles (or: their ParticleAccessors).
         If Particles cannot be retrieved (e.g. because the IDs are not available), returns None.
 
-        :arg id: 64-bit (signed or unsigned) integer ID of the Node to be popped (i.e. retrieved and removed) from this collections
-        :returns identified Node (if ID is related or an object contained in this collection) or None (if no Node can be retrieved)
+        :arg id: a list or numpy.ndarray of64-bit (signed or unsigned) integer IDs of Nodes to be popped
+                 (i.e. retrieved and removed) from this collections
+        :returns a list of retrieved Nodes
         """
         super().pop_multi_by_IDs(ids)
-        indices = self.get_indices_by_IDs(ids)
-        return self.pop_multi_by_indices(indices)
+        results = []
+        for id in ids:
+            results.append(self.pop_single_by_ID(id))
+            self._ncount -= 1
+        return results
 
     def _clear_deleted_(self):
         """
-        This (protected) function physically removes particles from the collection whose status is set to 'DELETE'.
+        This (protected) function physically removes particles from the collection whose status is set to 'OperationCode.Delete'.
         It is the logical finalisation method of physically deleting particles that have been marked for deletion and
         that have not otherwise been recovered.
         This methods in heavily dependent on the actual collection type and should be implemented very specific
         to the actual data structure, to remove objects 'the fastest way possible'.
         """
-        data_states = [p.state for p in self._data]
-        indices = np.where(data_states == OperationCode)
-        indices = None if len(indices) == 0 else indices[0]
-        indices = None if indices.size == 0 else indices
-        if indices is None:
-            return
-        if indices.size == 1:
-            indices = indices[0]
-            self.remove_single_by_index(indices)
-        else:
-            self.remove_multi_by_indices(indices)
+        node = self.begin()
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            next_node = node.next
+            if node.data.state == OperationCode.Delete:
+                node.unlink()
+                self._data.remove(node)
+            node = next_node
+        self._ncount = len(self._data)
 
     def merge(self, other=None):
         """
@@ -1128,7 +1391,8 @@ class ParticleCollectionAOS(ParticleCollection):
         Comment: the function can be simplified later by pre-evaluating the function parameter and then reference
         the individual, specific functions for internal- or external merge.
 
-        The function shall return the merged ParticleCollection.
+        :arg keys: None for initiating a merge of individual particles; a BaseParticleCollection object to be merged into
+                   this collection otherwise.
         """
         super().merge(other)
 
@@ -1159,6 +1423,9 @@ class ParticleCollectionAOS(ParticleCollection):
 
         The function shall return the newly created or extended Particle collection, i.e. either the collection that
         results from a collection split or this very collection, containing the newly-split particles.
+
+        :arg keys: None for initiating a merge of individual particles; a collection of indices or IDs of object to be
+                   merged into this collection otherwise.
         """
         return super().split(keys)
 
@@ -1169,6 +1436,33 @@ class ParticleCollectionAOS(ParticleCollection):
         """
         raise NotImplementedError
 
+    def get_deleted_item_indices(self):
+        """
+        :returns indices of particles that are marked for deletion.
+        """
+        indices = [i for i, n in enumerate(self._data) if n.isvalid() and n.data.state == OperationCode.Delete]
+        return indices
+
+    def get_deleted_item_IDs(self):
+        """
+        :returns indices of particles that are marked for deletion.
+        """
+        # we have 2 options of doing it, both of them are working.
+        # ---- Option 1: node-parsing way ---- #
+        # ids = []
+        # ndata = self.begin()
+        # while ndata is not None:
+        #     if not ndata.isvalid():
+        #         ndata = ndata.next
+        #         continue
+        #     if ndata.data.state == OperationCode.Delete:
+        #         ids.append(ndata.data.id)
+        #     ndata = ndata.next
+        # return ids
+        # ---- Option 2: pythonic list-comprehension way ---- #
+        ids = [ndata.data.id for ndata in self._data if ndata.isvalid() and ndata.data.state == OperationCode.Delete]
+        return ids
+
     def __sizeof__(self):
         """
         This function returns the size in actual bytes required in memory to hold the collection. Ideally and simply,
@@ -1177,11 +1471,20 @@ class ParticleCollectionAOS(ParticleCollection):
         sizeof(self) = len(self) * sizeof(pclass)
         :returns size of this collection in bytes; initiated by calling sys.getsizeof(object)
         """
-        sz = super(ParticleCollection, self).__sizeof__()
-        sz += self._data.nbytes if isinstance(self._data, np.ndarray) else sys.getsizeof(self._data)
-        if self._data_c is not None:
-            sz += self._data_c.nbytes if isinstance(self._data_c, np.ndarray) else sys.getsizeof(self._data_c)
-        return sz
+        size_bytes = super(ParticleCollection, self).__sizeof__()
+        i = 0
+        node = self.begin()
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            size_bytes += sys.getsizeof(node.data)
+            if self._data_c is not None:
+                size_bytes += sys.getsizeof(self._data_c[i]) if not isinstance(self._data_c, np.ndarray) else (self._data_c.nbytes / self._data_c.shape[0])
+            i += 1
+            node = node.next
+        return size_bytes
 
     def clear(self):
         """
@@ -1189,28 +1492,33 @@ class ParticleCollectionAOS(ParticleCollection):
         operation.
         """
         if self._data is not None:
-            del self._data
-            self._data = None
+            self._data.clear()
         if self._data_c is not None:
-            del self._data_c
-            self._data_c = None
+            del self._data_c[:]
         self._ncount = 0
 
     def cstruct(self):
         """
         'cstruct' returns the ctypes mapping of the particle data. This depends on the specific structure in question.
+
+        Nodes-structure doesn't work this way
+        raises NotImplementedError
         """
-        cstruct = self._data_c.ctypes.data_as(c_void_p)
-        return cstruct
+        raise NotImplementedError
 
     def toDictionary(self, pfile, time, deleted_only=False):
         """
         Convert all Particle data from one time step to a python dictionary.
         :param pfile: ParticleFile object requesting the conversion
         :param time: Time at which to write ParticleSet
-        :param deleted_only: Flag to write only the deleted Particles
-        returns two dictionaries: one for all variables to be written each outputdt,
-         and one for all variables to be written once
+        :param deleted_only: Flag to write only the deleted Particles or one of the following options:
+            i) boolean [True, False], where if 'True', we gather deleted indices internally
+            ii) list or np.array (type: [u]int[32]) of deleted indices to write
+            iii) list or np.array (type: [u]int64) of deleted IDs to write
+            iv) list of type(Node or derivatives) of deleted nodes to write
+            v) list of type(ScipyParticle or derivatives) of deleted Particles to write
+        :returns two dictionaries: one for all variables to be written each outputdt,
+         and one for all variables to be written once; the recurrent-written dict includes entries for attribute 'index'
 
         This function depends on the specific collection in question and thus needs to be specified in specific
         derivative classes.
@@ -1221,40 +1529,93 @@ class ParticleCollectionAOS(ParticleCollection):
         time = time.total_seconds() if isinstance(time, delta) else time
 
         indices_to_write = []
+        dataindices = []
+        valid = True
         if pfile.lasttime_written != time and \
-           (pfile.write_ondelete is False or deleted_only is not False):
+           (pfile.write_ondelete is False or deleted_only):
             if self._ncount == 0:
                 logger.warning("ParticleSet is empty on writing as array at time %g" % time)
-            else:
-                if deleted_only is not False:
+                valid = False
+            if not self._idgen.is_tracking_id_index():
+                logger.error("Cannot write node-based particle sets 'ParticleSetNodes' without tracking ID-indices.")
+                valid = False
+            if valid:
+                if deleted_only:
                     if type(deleted_only) not in [list, np.ndarray] and deleted_only in [True, 1]:
-                        data_states = [p.state for p in self._data]
-                        indices_to_write = np.where(np.isin(data_states, [OperationCode.Delete]))[0]
-                    elif type(deleted_only) in [list, np.ndarray] and len(deleted_only) > 0:
-                        if type(deleted_only[0]) in [int, np.int32, np.uint32]:
-                            indices_to_write = deleted_only
-                        elif isinstance(deleted_only[0], ScipyParticle):
-                            indices_to_write = [i for i, p in self._data if p in deleted_only]
+                        indices_to_write = [self._idgen.map_id_to_index(ndata.data.id) for ndata in self if ndata.data.state in [OperationCode.Delete, ]]
+                        dataindices = [self.get_index_by_node(ndata) for ndata in self if ndata.data.state in [OperationCode.Delete, ]]
+                    elif type(deleted_only) in [list, tuple, np.ndarray] and len(deleted_only) > 0:
+                        for D in deleted_only:
+                            if type(D) in [np.int64, np.uint64]:
+                                indices_to_write.append(self._idgen.map_id_to_index(D))
+                                dataindices.append(self.get_index_by_ID(D))
+                            elif type(D) in [int, np.int32, np.uint32]:
+                                raise RuntimeError("CollectNodes::toDictionary(): Writing particles by index is not supported.")
+                            elif isinstance(D, Node) and (self.get_index_by_node(D) is not None):
+                                indices_to_write.append(self._idgen.map_id_to_index(D.data.id))
+                                dataindices.append(self.get_index_by_node(D))
+                            elif isinstance(D, ScipyParticle) and (self.get_index_by_id(D.id) is not None):
+                                indices_to_write.append(self._idgen.map_id_to_index(D.id))
+                                dataindices.append(self.get_index_by_id(D.id))
                 else:
-                    indices_to_write = _to_write_particles(self._data, time)
+                    node = self.begin()
+                    while node is not None:
+                        if not node.isvalid():
+                            node = node.next
+                            continue
+                        if ((time - np.abs(node.data.dt / 2)) <= node.data.time < (time + np.abs(node.data.dt)) or np.equal(time, node.data.time)) and np.isfinite(node.data.id):
+                            node_index = self._idgen.map_id_to_index(node.data.id)
+                            p_index = self.get_index_by_node(node)
+                            if p_index is not None and node_index is not None:
+                                indices_to_write.append(node_index)
+                                dataindices.append(p_index)
+                        node = node.next
+                # ====================================================================================================================================== #
+                # ============== here, the indices need to be actual indices in the double-linked list ================================================= #
                 if len(indices_to_write) > 0:
                     for var in pfile.var_names:
                         if 'id' in var:
-                            data_dict[var] = np.array([np.int64(getattr(p, var)) for p in self._data[indices_to_write]])
+                            data_dict[var] = np.array([np.int64(getattr(self._data[index].data, var)) for index in dataindices])
+                # ====================================================================================================================================== #
+                # ================= HERE, THE INDICES NEED TO BE THE GLOBAL ONES ======================================================================= #
+                        elif var == 'index':
+                            data_dict[var] = np.array([np.int32(index) for index in indices_to_write])
                         else:
-                            data_dict[var] = np.array([getattr(p, var) for p in self._data[indices_to_write]])
+                            data_dict[var] = np.array([getattr(self._data[index].data, var) for index in dataindices])
+                # ====================================================================================================================================== #
+                # ================= HERE, THE INDICES NEED TO BE THE GLOBAL ONES ======================================================================= #
+                    pfile.max_index_written = np.maximum(pfile.max_index_written, np.max(indices_to_write))
 
-                pset_errs = [p for p in self._data[indices_to_write] if p.state != OperationCode.Delete and abs(time-p.time) > 1e-3 and np.isfinite(p.time)]
+                pset_errs = [self._data[index].data for index in dataindices if self._data[index].data.state != OperationCode.Delete and abs(time-self._data[index].data.time) > 1e-3 and np.isfinite(self._data[index].data.time)]
                 for p in pset_errs:
                     logger.warning_once('time argument in pfile.write() is %g, but a particle has time % g.' % (time, p.time))
+                indices_to_write.clear()
+                dataindices.clear()
+
+                if time not in pfile.time_written:
+                    pfile.time_written.append(time)
 
                 if len(pfile.var_names_once) > 0:
-                    first_write = [p for p in self._data if _is_particle_started_yet(p, time) and (np.int64(p.id) not in pfile.written_once)]
-                    if np.any(first_write):
-                        data_dict_once['id'] = np.array([p.id for p in first_write]).astype(dtype=np.int64)
+                    p_written_once = []
+                    node = self.begin()
+                    while node is not None:
+                        # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+                        if not node.isvalid():
+                            node = node.next
+                            continue
+                        node_index = self._idgen.map_id_to_index(node.data.id)
+                        if (node_index is not None) and (node.data.id not in pfile.written_once) and _is_particle_started_yet(node.data, time):
+                            p_written_once.append(node.data)
+                            indices_to_write.append(node_index)
+                        node = node.next
+                    if np.any(p_written_once):
+                        data_dict_once['id'] = np.array([p.id for p in p_written_once])
+                        data_dict_once['index'] = np.array(indices_to_write, dtype=np.int32)
                         for var in pfile.var_names_once:
-                            data_dict_once[var] = np.array([getattr(p, var) for p in first_write])
+                            data_dict_once[var] = np.array([getattr(p, var) for p in p_written_once])
                         pfile.written_once.extend(np.array(data_dict_once['id']).astype(dtype=np.int64).tolist())
+                        p_written_once.clear()
+                        indices_to_write.clear()
 
             if deleted_only is False:
                 pfile.lasttime_written = time
@@ -1273,8 +1634,18 @@ class ParticleCollectionAOS(ParticleCollection):
         trees, etc.), this may be 'the most constly' function in any kind of simulation.
 
         It can be - though - useful at the final stage of a simulation to dump the results to disk.
+        :returns vector-list (i.e. array) of Particle objects within this collection
         """
-        return self._data.tolist()
+        results = []
+        node = self.begin()
+        while node is not None:
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            if not node.isvalid():
+                node = node.next
+                continue
+            results.append(node.data)
+            node = node.next
+        return results
 
     def set_variable_write_status(self, var, write_status):
         """
@@ -1289,15 +1660,17 @@ class ParticleCollectionAOS(ParticleCollection):
                 var_changed = True
         if var_changed:
             for p in self._data:
-                attrib = getattr(p, var)
+                pdata = p.data
+                attrib = getattr(pdata, var)
                 if hasattr(attrib, 'to_write'):
                     attrib.to_write = write_status
-                setattr(p, var, attrib)
+                setattr(pdata, var, attrib)
+                p.set_data(pdata)
         if not var_changed:
             raise SyntaxError('Could not change the write status of %s, because it is not a Variable name' % var)
 
 
-class ParticleAccessorAOS(BaseParticleAccessor):
+class ParticleAccessorNodes(BaseParticleAccessor):
     """Wrapper that provides access to particle data in the collection,
     as if interacting with the particle itself.
 
@@ -1307,16 +1680,15 @@ class ParticleAccessorAOS(BaseParticleAccessor):
                   particle is stored in the corresponding data arrays
                   of the ParticleCollecion.
     """
-    _index = 0
+    _ndata = None
     _next_dt = None
 
-    def __init__(self, pcoll, index):
+    def __init__(self, pcoll, node_data):
         """Initializes the ParticleAccessor to provide access to one
         specific particle.
         """
-        super(ParticleAccessorAOS, self).__init__(pcoll)
-        self._index = index
-        self._next_dt = None
+        super(ParticleAccessorNodes, self).__init__(pcoll)
+        self._ndata = node_data
 
     def __getattr__(self, name):
         """Get the value of an attribute of the particle.
@@ -1325,12 +1697,20 @@ class ParticleAccessorAOS(BaseParticleAccessor):
         :return: The value of the particle attribute in the underlying
                  collection data array.
         """
-        if name in BaseParticleAccessor.__dict__.keys():
-            result = super(ParticleAccessorAOS, self).__getattr__(name)
+        result = None
+        if name == 'data':  # decision: return the ACTUAL particle
+            result = self._ndata.data
+        elif name in BaseParticleAccessor.__dict__.keys():
+            result = super(ParticleAccessorNodes, self).__getattr__(name)
         elif name in type(self).__dict__.keys():
             result = object.__getattribute__(self, name)
+        elif name in Node.__dict__.keys():
+            result = getattr(self._ndata, name)
         else:
-            result = getattr(self._pcoll.data[self._index], name)
+            try:
+                result = getattr(self._ndata.data, name)
+            except ValueError:
+                pass
         return result
 
     def __setattr__(self, name, value):
@@ -1340,94 +1720,82 @@ class ParticleAccessorAOS(BaseParticleAccessor):
         :param value: Value that will be assigned to the particle
                       attribute in the underlying collection data array.
         """
+        if name == 'data':
+            self._ndata.set_data(value)
         if name in BaseParticleAccessor.__dict__.keys():
-            super(ParticleAccessorAOS, self).__setattr__(name, value)
+            super(ParticleAccessorNodes, self).__setattr__(name, value)
         elif name in type(self).__dict__.keys():
             object.__setattr__(self, name, value)
+        elif name in Node.__dict__.keys():
+            Node.__setattr__(self._ndata, name, value)
         else:
-            setattr(self._pcoll.data[self._index], name, value)
+            setattr(self._ndata.data, name, value)
 
     def getPType(self):
-        return self._pcoll.data[self._index].getPType()
+        return self._ndata.data.getPType()
 
     def update_next_dt(self, next_dt=None):
-        if next_dt is None:
-            if self._next_dt is not None:
-                self._pcoll._data[self._index].dt = self._next_dt
-                self._next_dt = None
-        else:
-            self._next_dt = next_dt
+        if self._ndata is not None and self._ndata.data is not None:
+            self._ndata.data.update_next_dt(next_dt)
 
     def __repr__(self):
-        return repr(self._pcoll.data[self._index])
+        return repr(self._ndata.data)
 
 
-class ParticleCollectionIterableAOS(BaseParticleCollectionIterable):
+class ParticleCollectionIterableNodes(BaseParticleCollectionIterable):
 
     def __init__(self, pcoll, reverse=False, subset=None):
-        super(ParticleCollectionIterableAOS, self).__init__(pcoll, reverse, subset)
+        super(ParticleCollectionIterableNodes, self).__init__(pcoll, reverse, subset)
 
     def __iter__(self):
-        return ParticleCollectionIteratorAOS(pcoll=self._pcoll_immutable, reverse=self._reverse, subset=self._subset)
+        return ParticleCollectionIterableNodes(pcoll=self._pcoll_immutable, reverse=self._reverse, subset=self._subset)
 
 
-class ParticleCollectionIteratorAOS(BaseParticleCollectionIterator):
+class ParticleCollectionIteratorNodes(BaseParticleCollectionIterator):
     """Iterator for looping over the particles in the ParticleCollection.
 
     :param pcoll: ParticleCollection that stores the particles.
     :param reverse: Flag to indicate reverse iteration (i.e. starting at
                     the largest index, instead of the smallest).
-    :param subset: Subset of indices to iterate over, this allows the
-                   creation of an iterator that represents part of the
-                   collection.
+    :param subset: parameter not applicable, as nodes are not based on indices
     """
 
     def __init__(self, pcoll, reverse=False, subset=None):
-
-        if subset is not None:
-            if len(subset) > 0 and type(subset[0]) not in [int, np.int32, np.intp]:
-                raise TypeError("Iteration over a subset of particles in the"
-                                " particleset requires a list or numpy array"
-                                " of indices (of type int or np.int32).")
-            if reverse:
-                self._indices = subset.reverse()
-            else:
-                self._indices = subset
-            self.max_len = len(subset)
-        else:
-            self.max_len = len(pcoll)
-            if reverse:
-                self._indices = range(self.max_len - 1, -1, -1)
-            else:
-                self._indices = range(self.max_len)
-
         self._reverse = reverse
         self._pcoll = pcoll
-        self._prev_index = -1
-        self._index = 0
         self._head = None
         self._tail = None
-        if len(self._indices) > 0:
-            self._head = ParticleAccessorAOS(pcoll, self._indices[0])
-            self._tail = ParticleAccessorAOS(pcoll, self._indices[self.max_len - 1])
-        self.p = None
+        if not self._reverse:
+            self._head = self._pcoll.begin()
+            self._tail = self._pcoll.end()
+        else:
+            self._head = self._pcoll.end()
+            self._tail = self._pcoll.begin()
+        self.p = self._head
 
     def __next__(self):
         """Returns a ParticleAccessor for the next particle in the
         ParticleSet.
         """
-        if self._index < self.max_len:
-            self._prev_index = self._index
-            self._index += 1
-            return ParticleAccessorAOS(self._pcoll, self._indices[self._prev_index])
+        result = None
+        p_prev = self.p
+        if self.p is not None:
+            result = ParticleAccessorNodes(self._pcoll, self.p)
+            # ==== we need to skip here deleted nodes that have been queued for deletion, but are still bound in memory ==== #
+            self.p = self.p.prev if self._reverse else self.p.next
+            while (self.p is not None) and (not self.p.isvalid()):
+                self.p = self.p.prev if self._reverse else self.p.next
+        result = result if self.p != p_prev else None
+        if result is not None:
+            return result
         raise StopIteration
 
     @property
     def current(self):
-        if (self.max_len > self._prev_index) and (self._prev_index > -1):
-            return ParticleAccessorAOS(self._pcoll, self._indices[self._prev_index])
+        if self.p is not None:
+            return ParticleAccessorNodes(self._pcoll, self.p)
         raise IndexError
 
     def __repr__(self):
         dir_str = 'Backward' if self._reverse else 'Forward'
-        return "%s iteration at index %s of %s." % (dir_str, self._index, self.max_len)
+        return "%s iteration at id %s." % (dir_str, self.p.data.id)

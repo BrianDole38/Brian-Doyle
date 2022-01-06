@@ -4,8 +4,8 @@ from os import path
 
 import numpy as np
 
-# == here those classes need to be impported to parse available ParticleFile classes and create the type from its name == #
-from parcels import ParticleFile, ParticleFileSOA, ParticleFileAOS  # NOQA
+# == here those classes need to be imported to parse available ParticleFile classes and create the type from its name == #
+from parcels import ParticleFile, ParticleFileSOA, ParticleFileAOS, ParticleFileNodes  # NOQA
 
 
 def convert_npydir_to_netcdf(tempwritedir_base, delete_tempfiles=False, pfile_class=None):
@@ -13,7 +13,6 @@ def convert_npydir_to_netcdf(tempwritedir_base, delete_tempfiles=False, pfile_cl
     :param tempwritedir_base: directory where the directories for temporary npy files
             are stored (can be obtained from ParticleFile.tempwritedir_base attribute)
     """
-
     tempwritedir = sorted(glob(path.join("%s" % tempwritedir_base, "*")),
                           key=lambda x: int(path.basename(x)))[0]
     pyset_file = path.join(tempwritedir, 'pset_info.npy')
@@ -24,6 +23,7 @@ def convert_npydir_to_netcdf(tempwritedir_base, delete_tempfiles=False, pfile_cl
 
     pset_info = np.load(pyset_file, allow_pickle=True).item()
     pfconstructor = ParticleFile if pfile_class is None else pfile_class
+    pfconstructor = globals()[pfconstructor] if type(pfconstructor) is str else pfconstructor
     pfile = pfconstructor(None, None, pset_info=pset_info, tempwritedir=tempwritedir_base, convert_at_end=False)
     pfile.close(delete_tempfiles)
 
@@ -44,7 +44,8 @@ def main(tempwritedir_base=None, delete_tempfiles=False):
             delete_tempfiles = args.delete_tempfiles
         if hasattr(args, 'pfclass_name'):
             try:
-                pfclass = locals()[args.pfclass_name]
+                globaldicts = globals()
+                pfclass = globaldicts[args.pfclass_name]
             except:
                 pfclass = ParticleFile
 

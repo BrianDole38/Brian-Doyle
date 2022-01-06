@@ -1,6 +1,9 @@
 import os
+import sys
 import subprocess
 from struct import calcsize
+from parcels.tools import logger
+from sys import platform
 
 try:
     from mpi4py import MPI
@@ -102,14 +105,22 @@ class GNU_parameters(Compiler_parameters):
         opt_flags = ['-g', '-O3']
         arch_flag = ['-m64' if calcsize("P") == 8 else '-m32']
         self._cppargs = ['-Wall', '-fPIC', '-std=gnu11']
-        self._cppargs += Iflags
+        if len(incdirs) > 0:
+            self._cppargs += Iflags
         self._cppargs += opt_flags + cppargs + arch_flag
         self._ldargs = ['-shared']
-        self._ldargs += Lflags
-        self._ldargs += lflags
-        self._ldargs += ldargs
+        if len(Lflags) > 0 and len(libdirs) > 0:
+            # possible platform values: https://stackoverflow.com/questions/446209/possible-values-from-sys-platform/13874620#13874620
+            if sys.platform != 'darwin':
+                self._ldargs += ['-Wl,-rpath=%s' % (":".join(libdirs))]
+            else:
+                self._ldargs += ['-Wl,-rpath,%s' % (",-rpath,".join(libdirs))]
+
         if len(Lflags) > 0:
-            self._ldargs += ['-Wl, -rpath=%s' % (":".join(libdirs))]
+            self._ldargs += Lflags
+        if len(lflags) > 0:
+            self._ldargs += lflags
+        self._ldargs += ldargs
         self._ldargs += arch_flag
         self._incdirs = incdirs
         self._libdirs = libdirs
@@ -221,7 +232,7 @@ class CCompiler(object):
         self._libs = libs  # only possible for already-compiled, external libraries
 
     def compile(self, src, obj, log):
-        pass
+        return None
 
     def _create_compile_process_(self, cmd, src, log):
         with open(log, 'w') as logfile:
@@ -265,7 +276,73 @@ class CCompiler_SS(CCompiler):
         cc = [self._cc] + self._cppargs + ['-o', obj, src] + self._ldargs
         with open(log, 'w') as logfile:
             logfile.write("Compiling: %s\n" % " ".join(cc))
-        self._create_compile_process_(cc, src, log)
+        success = self._create_compile_process_(cc, obj, log)
+        if success and os.path.exists(log):
+            logger.info("Successfully compiled and linked {} into {}.".format(src, obj))
+        else:
+            logger.error("Error during linking of {} from {}:".format(obj, src))
+            if os.path.exists(log):
+                with open(log, 'r') as liblog:
+                    logger.info("Log output: %s" % (liblog.read()))
+        return obj
+
+
+class CCompiler_MS(CCompiler):
+    """
+    multi-stage C-compiler: used for multiple source files
+    """
+    def __init__(self, cc=None, cppargs=None, ldargs=None, incdirs=None, libdirs=None, libs=None, tmp_dir=os.getcwd()):
+        super(CCompiler_MS, self).__init__(cc=cc, cppargs=cppargs, ldargs=ldargs, incdirs=incdirs, libdirs=libdirs, libs=libs, tmp_dir=tmp_dir)
+
+    def __str__(self):
+        output = "[CCompiler_MS]: "
+        output += "('cc': {}), ".format(self._cc)
+        output += "('cppargs': {}), ".format(self._cppargs)
+        output += "('ldargs': {}), ".format(self._ldargs)
+        output += "('incdirs': {}), ".format(self._incdirs)
+        output += "('libdirs': {}), ".format(self._libdirs)
+        output += "('libs': {}), ".format(self._libs)
+        output += "('tmp_dir': {}), ".format(self._tmp_dir)
+        return output
+
+    def compile(self, src, obj, log):
+        objs = []
+        for src_file in src:
+            src_file_wo_ext = os.path.splitext(src_file)[0]
+            src_file_wo_ppath = os.path.basename(src_file_wo_ext)
+            if MPI and MPI.COMM_WORLD.Get_size() > 1:
+                src_file_wo_ppath = "%s_%d" % (src_file_wo_ppath, MPI.COMM_WORLD.Get_rank())
+            obj_file = os.path.join(self._tmp_dir, src_file_wo_ppath) + "." + self._obj_ext
+            objs.append(obj_file)
+            slog_file = os.path.join(self._tmp_dir, src_file_wo_ppath) + "_o" + "." + "log"
+            cc = [self._cc] + self._cppargs + ['-c', src_file] + ['-o', obj_file]
+            with open(log, 'w') as logfile:
+                logfile.write("Compiling: %s\n" % " ".join(cc))
+            success = self._create_compile_process_(cc, src_file, slog_file)
+            if success and os.path.exists(slog_file):
+                os.remove(slog_file)
+                logger.info("Successfully compiled {} into {}.".format(src_file, obj_file))
+            else:
+                logger.error("Error during compilation of {} from {}:".format(src_file, obj_file))
+                if os.path.exists(slog_file):
+                    with open(slog_file, 'r') as objlog:
+                        logger.info("Log output: %s" % (objlog.read()))
+        # see 'Compiler_parameters':  self._libdirs and self._libs *should* already included in self._ldargs
+        cc = [self._cc] + objs + ['-o', obj] + self._ldargs
+        with open(log, 'a') as logfile:
+            logfile.write("Linking: %s\n" % " ".join(cc))
+        success = self._create_compile_process_(cc, obj, log)
+        if success and os.path.exists(log):
+            logger.info("Successfully linked {} into {}.".format(objs, obj))
+        else:
+            logger.error("Error during linking of {} from {}:".format(obj, objs))
+            if os.path.exists(log):
+                with open(log, 'r') as liblog:
+                    logger.info("Log output: %s" % (liblog.read()))
+        for fpath in objs:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        return obj
 
 
 class GNUCompiler_SS(CCompiler_SS):
@@ -285,9 +362,35 @@ class GNUCompiler_SS(CCompiler_SS):
     def compile(self, src, obj, log):
         lib_pathfile = os.path.basename(obj)
         lib_pathdir = os.path.dirname(obj)
+        if lib_pathfile[0:3] != "lib" and platform != 'win32':
+            lib_pathfile = "lib"+lib_pathfile
         obj = os.path.join(lib_pathdir, lib_pathfile)
 
-        super(GNUCompiler_SS, self).compile(src, obj, log)
+        return super(GNUCompiler_SS, self).compile(src, obj, log)
+
+
+class GNUCompiler_MS(CCompiler_MS):
+    """A compiler object for the GNU Linux toolchain.
+
+    :arg cppargs: A list of arguments to pass to the C compiler
+         (optional).
+    :arg ldargs: A list of arguments to pass to the linker (optional)."""
+    def __init__(self, cppargs=None, ldargs=None, incdirs=None, libdirs=None, libs=None, tmp_dir=os.getcwd()):
+        c_params = GNU_parameters(cppargs, ldargs, incdirs, libdirs, libs)
+        super(GNUCompiler_MS, self).__init__(c_params.compiler, cppargs=c_params.cppargs, ldargs=c_params.ldargs, incdirs=c_params.incdirs, libdirs=c_params.libdirs, libs=c_params.libs, tmp_dir=tmp_dir)
+        self._dynlib_ext = c_params.dynlib_ext
+        self._stclib_ext = c_params.stclib_ext
+        self._obj_ext = c_params.obj_ext
+        self._exe_ext = c_params.exe_ext
+
+    def compile(self, src, obj, log):
+        lib_pathfile = os.path.basename(obj)
+        lib_pathdir = os.path.dirname(obj)
+        if lib_pathfile[0:3] != "lib" and platform != 'win32':
+            lib_pathfile = "lib"+lib_pathfile
+        obj = os.path.join(lib_pathdir, lib_pathfile)
+
+        return super(GNUCompiler_MS, self).compile(src, obj, log)
 
 
 GNUCompiler = GNUCompiler_SS

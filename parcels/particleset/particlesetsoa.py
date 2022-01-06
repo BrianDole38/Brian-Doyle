@@ -2,17 +2,16 @@ from datetime import date
 from datetime import datetime
 from datetime import timedelta as delta
 
-import sys
 import numpy as np
 import xarray as xr
 from copy import copy
 
 from parcels.grid import GridCode
 from parcels.grid import CurvilinearGrid
-from parcels.kernel import Kernel
+from parcels.kernel import KernelSOA
 from parcels.particle import Variable, ScipyParticle, JITParticle  # noqa
-from parcels.particlefile import ParticleFile
-from parcels.tools.statuscodes import StateCode
+from parcels.particlefile import ParticleFileSOA
+from parcels.tools.statuscodes import StateCode, OperationCode    # noqa: F401
 from parcels.particleset.baseparticleset import BaseParticleSet
 from parcels.collection.collectionsoa import ParticleCollectionSOA
 from parcels.collection.collectionsoa import ParticleCollectionIteratorSOA  # noqa
@@ -86,6 +85,9 @@ class ParticleSetSOA(BaseParticleSet):
 
     Other Variables can be initialised using further arguments (e.g. v=... for a Variable named 'v')
     """
+    _active_particle_idx = None
+    _values = None
+    _dirty_neighbor = False
 
     def __init__(self, fieldset=None, pclass=JITParticle, lon=None, lat=None,
                  depth=None, time=None, repeatdt=None, lonlatdepth_dtype=None,
@@ -94,9 +96,16 @@ class ParticleSetSOA(BaseParticleSet):
 
         # ==== first: create a new subclass of the pclass that includes the required variables ==== #
         # ==== see dynamic-instantiation trick here: https://www.python-course.eu/python3_classes_and_type.php ==== #
-        class_name = "Array"+pclass.__name__
+
+        Alist = [pclass.__name__[0:6], pclass.__name__[0:5]]
+        Blist = ['Array', 'Object']
+        class_is_derived = any([key in Blist for key in Alist])
+        class_name = "Array"+pclass.__name__ if not class_is_derived else pclass.__name__
         array_class = None
-        if class_name not in dir():
+        if class_is_derived:
+            logger.warn("Reusing original class '{}' instead of deriving an array-version again. This is potentially incorrect - please check your object naming.".format(pclass.__name__))
+            array_class = pclass
+        elif class_name not in dir():
             def ArrayClass_init(self, *args, **kwargs):
                 fieldset = kwargs.get('fieldset', None)
                 ngrids = kwargs.get('ngrids', None)
@@ -123,15 +132,16 @@ class ParticleSetSOA(BaseParticleSet):
                                  "__init__": ArrayClass_init}
             array_class = type(class_name, (pclass, ), array_class_vdict)
         else:
+            logger.warn("Reusing original class '{}' instead of deriving an array-version again. This is potentially incorrect - please check your object naming.".format(pclass.__name__))
             array_class = locals()[class_name]
         # ==== dynamic re-classing completed ==== #
         _pclass = array_class
 
-        self.fieldset = fieldset
-        if self.fieldset is None:
+        self._fieldset = fieldset
+        if self._fieldset is None:
             logger.warning_once("No FieldSet provided in ParticleSet generation. This breaks most Parcels functionality")
         else:
-            self.fieldset.check_complete()
+            self._fieldset.check_complete()
         partitions = kwargs.pop('partitions', None)
 
         lon = np.empty(shape=0) if lon is None else _convert_to_array(lon)
@@ -141,7 +151,7 @@ class ParticleSetSOA(BaseParticleSet):
             pid_orig = np.arange(lon.size)
 
         if depth is None:
-            mindepth = self.fieldset.gridset.dimrange('depth')[0] if self.fieldset is not None else 0
+            mindepth = self._fieldset.gridset.dimrange('depth')[0] if self._fieldset is not None else 0
             depth = np.ones(lon.size) * mindepth
         else:
             depth = _convert_to_array(depth)
@@ -153,7 +163,7 @@ class ParticleSetSOA(BaseParticleSet):
 
         if time.size > 0 and type(time[0]) in [datetime, date]:
             time = np.array([np.datetime64(t) for t in time])
-        self.time_origin = fieldset.time_origin if self.fieldset is not None else 0
+        self.time_origin = fieldset.time_origin if self._fieldset is not None else 0
         if time.size > 0 and isinstance(time[0], np.timedelta64) and not self.time_origin:
             raise NotImplementedError('If fieldset.time_origin is not a date, time of a particle must be a double')
         time = np.array([self.time_origin.reltime(t) if _convert_to_reltime(t) else t for t in time])
@@ -182,7 +192,7 @@ class ParticleSetSOA(BaseParticleSet):
             self.repeatpclass = pclass
             self.repeatkwargs = kwargs
 
-        ngrids = fieldset.gridset.size if fieldset is not None else 1
+        ngrids = self._fieldset.gridset.size if self._fieldset is not None else 1
 
         # Variables used for interaction kernels.
         inter_dist_horiz = None
@@ -253,10 +263,30 @@ class ParticleSetSOA(BaseParticleSet):
                 mpi_rank = mpi_comm.Get_rank()
                 self.repeatpid = pid_orig[self._collection.pu_indicators == mpi_rank]
 
-        self.kernel = None
+        self._kernel = None
+        self._kclass = KernelSOA
+        self._active_particle_idx = None
+        self._values = None
 
     def __del__(self):
         super(ParticleSetSOA, self).__del__()
+
+    def delete(self, key):
+        """
+        This is the generic super-method to indicate obejct deletion of a specific object from this collection.
+
+        Comment/Annotation:
+        Functions for deleting multiple objects are more specialised than just a for-each loop of single-item deletion,
+        because certain data structures can delete multiple objects in-bulk faster with specialised function than making a
+        roundtrip per-item delete operation. Because of the sheer size of those containers and the resulting
+        performance demands, we need to make use of those specialised 'del' functions, where available.
+        """
+        if key is None:
+            return
+        if type(key) in [int, np.int32, np.intp]:
+            self._collection.delete_by_index(key)
+        elif type(key) in [np.int64, np.uint64]:
+            self._collection.delete_by_ID(key)
 
     def _set_particle_vector(self, name, value):
         """Set attributes of all particles to new values.
@@ -300,7 +330,7 @@ class ParticleSetSOA(BaseParticleSet):
         may be quite expensive.
         """
 
-        if self.fieldset is None:
+        if self._fieldset is None:
             # we need to be attached to a fieldset to have a valid
             # gridset to search for indices
             return
@@ -446,8 +476,9 @@ class ParticleSetSOA(BaseParticleSet):
         for v in pclass.getPType().variables:
             if v.name in pfile_vars:
                 vars[v.name] = np.ma.filled(pfile.variables[v.name], np.nan)
-            elif v.name not in ['xi', 'yi', 'zi', 'ti', 'dt', '_next_dt', 'depth', 'id', 'fileid', 'state'] \
+            elif v.name not in ['xi', 'yi', 'zi', 'ti', 'dt', '_next_dt', 'depth', 'id', 'state'] \
                     and v.to_write:
+                # , 'fileid'
                 raise RuntimeError('Variable %s is in pclass but not in the particlefile' % v.name)
             to_write[v.name] = v.to_write
         vars['depth'] = np.ma.filled(pfile.variables['z'], np.nan)
@@ -476,6 +507,7 @@ class ParticleSetSOA(BaseParticleSet):
             pclass.setLastID(0)  # reset to zero offset
         else:
             vars['id'] = None
+        pfile.close()
 
         return cls(fieldset=fieldset, pclass=pclass, lon=vars['lon'], lat=vars['lat'],
                    depth=vars['depth'], time=vars['time'], pid_orig=vars['id'],
@@ -522,19 +554,8 @@ class ParticleSetSOA(BaseParticleSet):
         neighbor_ids = self._collection.data['id'][neighbor_idx]
         return neighbor_ids
 
-    @property
-    def size(self):
-        # ==== to change at some point - len and size are different things ==== #
-        return len(self._collection)
-
     def __repr__(self):
         return "\n".join([str(p) for p in self])
-
-    def __len__(self):
-        return len(self._collection)
-
-    def __sizeof__(self):
-        return sys.getsizeof(self._collection)
 
     def __iadd__(self, particles):
         """Add particles to the ParticleSet. Note that this is an
@@ -545,7 +566,14 @@ class ParticleSetSOA(BaseParticleSet):
                           to this one.
         :return: The current ParticleSet
         """
-        self.add(particles)
+        if isinstance(particles, type(self)):
+            self._collection += particles.collection
+            self._dirty_neighbor = True
+        elif isinstance(particles, BaseParticleSet):
+            self._collection.merge_collection(particles.collection)
+            self._dirty_neighbor = True
+        else:
+            pass
         return self
 
     def __iter__(self):
@@ -554,20 +582,90 @@ class ParticleSetSOA(BaseParticleSet):
     def iterator(self):
         return super(ParticleSetSOA, self).iterator()
 
-    def add(self, particles):
+    def add(self, value):
         """Add particles to the ParticleSet. Note that this is an
         incremental add, the particles will be added to the ParticleSet
         on which this function is called.
 
-        :param particles: Another ParticleSet containing particles to add to this one.
+        :param particles: Another ParticleSet, an numpy.ndarray or a particle
+                          to add to this one.
         :return: The current ParticleSet
         """
-        if isinstance(particles, BaseParticleSet):
-            particles = particles.collection
-        self._collection += particles
-        # Adding particles invalidates the neighbor search structure.
-        self._dirty_neighbor = True
+        if isinstance(value, type(self)):
+            self._collection.merge_same(value.collection)
+            self._dirty_neighbor = True
+        elif isinstance(value, BaseParticleSet):
+            self._collection.merge_collection(value.collection)
+            self._dirty_neighbor = True
+        elif isinstance(value, np.ndarray) or isinstance(value, dict) or isinstance(value, list) or isinstance(value, tuple):
+            self._collection.add_multiple(value)
+            self._dirty_neighbor = True
+        elif isinstance(value, ScipyParticle):
+            self._collection.add_single(value)
+            self._dirty_neighbor = True
+
+    def split_by_index(self, indices):
+        """
+        This function splits this collection into two disect equi-structured collections using the indices as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        super().split_by_index(indices)
+        assert len(self._collection) > 0
+        result = ParticleSetSOA(pclass=self.pclass, lon=[], lat=[], time=[], lonlatdepth_dtype=self._collection.lonlatdepth_dtype, pid_orig=None, fieldset=self.fieldset)
+        idx = sorted(indices, reverse=True)
+        tmp = []
+        for index in idx:  # pop-based process needs to start from the back of the queue
+            pdata = self._collection.pop_single_by_index(index=index)
+            tmp.append(pdata)
+        rdata = reversed(tmp)
+        for pdata in rdata:  # add particles in correct order again
+            result.add(pdata)
+        return result
+
+    def split_by_id(self, ids):
+        """
+        This function splits this collection into two disect equi-structured collections using the indices as subset.
+        The reason for it can, for example, be that the set exceeds a pre-defined maximum number of elements, which for
+        performance reasons mandates a split.
+
+        The function returns the newly created or extended Particle collection, i.e. either the collection that
+        results from a collection split or this very collection, containing the newly-split particles.
+        """
+        super().split_by_id(ids)
+        assert len(self._collection) > 0
+        result = ParticleSetSOA(pclass=self.pclass, lon=[], lat=[], time=[], lonlatdepth_dtype=self._collection.lonlatdepth_dtype, pid_orig=None, fieldset=self.fieldset)
+        for id in ids:
+            pdata = self._collection.pop_single_by_ID(id)
+            result.add(pdata)
+        return result
+
+    def __isub__(self, pset):
+        if isinstance(pset, type(self)):
+            self._collection -= pset.collection
+        elif isinstance(pset, BaseParticleSet):
+            self._collection.remove_collection(pset.collection)
+        else:
+            pass
         return self
+
+    def remove(self, value):
+        """
+        Removes a particles by index from the array. The indices can either be given directly as integer- or array-of-integer,
+        or deduced by the collection itself.
+        :param ndata: ParticleSet object, array of integer indices or a single integer index
+        """
+        if isinstance(value, type(self)):
+            self._collection.remove_same(value.collection)
+        elif isinstance(value, BaseParticleSet):
+            self._collection.remove_collection(value.collection)
+        elif type(value) in [int, np.int32, np.intp]:
+            self._collection.remove_single_by_index(value)
+        else:
+            self._collection.remove_multi_by_indices(value)
 
     def remove_indices(self, indices):
         """Method to remove particles from the ParticleSet, based on their `indices`"""
@@ -600,15 +698,15 @@ class ParticleSetSOA(BaseParticleSet):
         """
 
         field_name = field_name if field_name else "U"
-        field = getattr(self.fieldset, field_name)
+        field = getattr(self._fieldset, field_name)
 
         f_str = """
 def search_kernel(particle, fieldset, time):
     x = fieldset.{}[time, particle.depth, particle.lat, particle.lon]
         """.format(field_name)
 
-        k = Kernel(
-            self.fieldset,
+        k = KernelSOA(
+            self._fieldset,
             self._collection.ptype,
             funcname="search_kernel",
             funcvars=["particle", "fieldset", "time", "x"],
@@ -646,10 +744,14 @@ def search_kernel(particle, fieldset, time):
 
         :param delete_cfiles: Boolean whether to delete the C-files after compilation in JIT mode (default is True)
         """
-        return Kernel(self.fieldset, self.collection.ptype, pyfunc=pyfunc, c_include=c_include,
-                      delete_cfiles=delete_cfiles)
+        return self._kclass(self.fieldset, self.collection.ptype, pyfunc=pyfunc, c_include=c_include,
+                            delete_cfiles=delete_cfiles)
 
     def InteractionKernel(self, pyfunc_inter):
+        """
+        This function creates a new InteraktionKernel, if the respective interaction function is set.
+        :returns instance of BaseInteractionKernel, if pyfunc_inter != None
+        """
         if pyfunc_inter is None:
             return None
         return InteractionKernelSOA(self.fieldset, self.collection.ptype, pyfunc=pyfunc_inter)
@@ -657,7 +759,7 @@ def search_kernel(particle, fieldset, time):
     def ParticleFile(self, *args, **kwargs):
         """Wrapper method to initialise a :class:`parcels.particlefile.ParticleFile`
         object from the ParticleSet"""
-        return ParticleFile(*args, particleset=self, **kwargs)
+        return ParticleFileSOA(*args, particleset=self, **kwargs)
 
     def set_variable_write_status(self, var, write_status):
         """

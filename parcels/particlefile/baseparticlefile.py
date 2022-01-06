@@ -1,5 +1,6 @@
 """Module controlling the writing of ParticleSets to NetCDF file"""
 import os
+import sys
 import random
 import shutil
 import string
@@ -67,6 +68,8 @@ class BaseParticleFile(ABC):
     file_list = None
     var_names_once = None
     var_dtypes_once = None
+    fill_value_map = dict()
+    fmt_map = dict()
     file_list_once = None
     maxid_written = -1
     tempwritedir_base = None
@@ -74,11 +77,26 @@ class BaseParticleFile(ABC):
 
     def __init__(self, name, particleset, outputdt=np.infty, write_ondelete=False, convert_at_end=True,
                  tempwritedir=None, pset_info=None):
+        """
+        BaseParticleFile - Constructor
+        :param name: Basename of the output file
+        :param particleset: ParticleSet to output
+        :param outputdt: Interval which dictates the update frequency of file output
+                         while ParticleFile is given as an argument of ParticleSet.execute()
+                         It is either a timedelta object or a positive double.
+        :param write_ondelete: Boolean to write particle data only when they are deleted. Default is False
+        :param convert_at_end: Boolean to convert npy files to netcdf at end of run. Default is True
+        :param tempwritedir: directories to write temporary files to during executing.
+                         Default is out-XXXXXX where Xs are random capitals. Files for individual
+                         processors are written to subdirectories 0, 1, 2 etc under tempwritedir
+        :param pset_info: dictionary of info on the ParticleSet, stored in tempwritedir/XX/pset_info.npy,
+                         used to create NetCDF file from npy-files.
+        """
 
         self.write_ondelete = write_ondelete
         self.convert_at_end = convert_at_end
         self.outputdt = outputdt
-        self.lasttime_written = None  # variable to check if time has been written already
+        self.lasttime_written = None
 
         self.dataset = None
         self.metadata = {}
@@ -110,6 +128,13 @@ class BaseParticleFile(ABC):
 
             self.file_list = []
 
+        # Create dictionary to translate datatypes and fill_values
+        self.fmt_map = {np.float32: 'f4', np.float64: 'f8',
+                        np.bool_: 'i1', np.int16: 'i2', np.int32: 'i4', np.int64: 'i8'}
+        self.fill_value_map = {np.float32: np.nan, np.float64: np.nan,
+                               np.bool_: np.iinfo(np.int8).min, np.int16: np.iinfo(np.int16).max,
+                               np.int32: np.iinfo(np.int32).max, np.int64: np.iinfo(np.int64).max}
+
         tmp_dir = tempwritedir
         if tempwritedir is None:
             tmp_dir = os.path.join(os.path.dirname(str(self.name)), "out-%s" % ''.join(random.choice(string.ascii_uppercase) for _ in range(8)))
@@ -128,6 +153,31 @@ class BaseParticleFile(ABC):
             os.makedirs(self.tempwritedir)
         elif pset_info is None:
             raise IOError("output directory %s already exists. Please remove the directory." % self.tempwritedir)
+
+    def __del__(self):
+        """
+        BaseParticleFile - Destructor
+        """
+        if self.convert_at_end:
+            self.close()
+
+    def __sizeof__(self):
+        """
+        :returns size (in bytes) of the ParticleFile
+        """
+        sz = 0
+        if self.var_names is not None:
+            for vname in self.var_names:
+                sz += sys.getsizeof(getattr(self, vname)) if getattr(self, vname) is not None else 0
+        if self.var_names_once is not None:
+            for vname in self.var_names_once:
+                sz += sys.getsizeof(getattr(self, vname)) if getattr(self, vname) is not None else 0
+        for var in [self.outputdt, self.lasttime_written, self.dataset, self.metadata, self.name, self.parcels_mesh,
+                    self.time_origin, self.lonlatdepth_dtype, self.var_names, self.file_list, self.var_names_once,
+                    self.file_list_once, self.tempwritedir_base, self.tempwritedir]:
+            sz += sys.getsizeof(var) if var is not None else 0
+        sz += sys.getsizeof(self.maxid_written)
+        return sz
 
     @abstractmethod
     def _reserved_var_names(self):
@@ -156,9 +206,17 @@ class BaseParticleFile(ABC):
         self._create_metadata_records()
 
     def close_netcdf_file(self):
+        """
+        closes the NetCDF file and flushes the written content to disk
+        """
         self.dataset.close()
 
     def _create_trajectory_file(self, fname, data_shape):
+        """
+        This function opens the related NetCDF file and creates its dataset.
+        :arg fname: filepath of the NetCDF file to be written
+        :arg data_shape: shape of the record to be written
+        """
         self.dataset = netCDF4.Dataset(fname, "w", format="NETCDF4")
         self.dataset.createDimension("obs", data_shape[1])
         self.dataset.createDimension("traj", data_shape[0])
@@ -173,12 +231,13 @@ class BaseParticleFile(ABC):
     def _create_trajectory_records(self, coords):
         """
         creates the NetCDF record structure of a trajectory.
+        :arg coords: tuple of dictionary keys for # entities ("traj(ectories)") and timesteps ("obs(ervations)")
 
         Attention:
         For ParticleSet structures other than SoA, and structures where ID != index, this has to be overridden.
         """
         # Create ID variable according to CF conventions
-        self.id = self.dataset.createVariable("trajectory", "i8", coords, fill_value=-2**(63))  # minint64 fill_value
+        self.id = self.dataset.createVariable("trajectory", "i8", coords, fill_value=-2**(63))
         self.id.long_name = "Unique identifier for each particle"
         self.id.cf_role = "trajectory_id"
 
@@ -219,6 +278,13 @@ class BaseParticleFile(ABC):
             self.z.units = "m"
             self.z.positive = "down"
 
+        self._create_variable_records(coords=coords)
+
+    def _create_variable_records(self, coords):
+        """
+        creates the NetCDF record structure for the (user-defined) variables of a trajectory.
+        :arg coords: tuple of dictionary keys for # entities ("traj(ectories)") and timesteps ("obs(ervations)")
+        """
         for vname, dtype in zip(self.var_names, self.var_dtypes):
             if vname not in self._reserved_var_names():
                 fill_value = self.fill_value_map[dtype]
@@ -237,16 +303,18 @@ class BaseParticleFile(ABC):
             getattr(self, vname).units = "unknown"
 
     def _create_metadata_records(self):
+        """
+        this function creates the metadata (i.e. the header) of the NetCDF file
+        """
         for name, message in self.metadata.items():
             setattr(self.dataset, name, message)
 
-    def __del__(self):
-        if self.convert_at_end:
-            self.close()
-
     def close(self, delete_tempfiles=True):
-        """Close the ParticleFile object by exporting and then deleting
-        the temporary npy files"""
+        """
+        Close the ParticleFile object by exporting and then deleting
+        the temporary npy files
+        :arg delete_tempfiles: boolean, telling if the temporary npy files are to be deleted or not
+        """
         self.export()
         mpi_rank = MPI.COMM_WORLD.Get_rank() if MPI else 0
         if mpi_rank == 0:
@@ -265,8 +333,22 @@ class BaseParticleFile(ABC):
         else:
             setattr(self.dataset, name, message)
 
+    @abstractmethod
+    def get_pset_info_attributes(self):
+        """
+        :returns the main attributes of the pset_info.npy file.
+
+        Attention:
+        For ParticleSet structures other than SoA, and structures where ID != index, this has to be overridden.
+        """
+        return None
+
     def dump_dict_to_npy(self, data_dict, data_dict_once):
-        """Buffer data to set of temporary numpy files, using np.save"""
+        """
+        Buffer data to set of temporary numpy files, using np.save
+        :arg data_dict: a dict of data, each entry associating 'var_name' -> 2D numpy.ndarray of values (# particles x timesteps)
+        :arg data_dict_once:  a dict of data, each entry associating 'var_name' -> 2D numpy.ndarray of values, only written once
+        """
 
         if not os.path.exists(self.tempwritedir):
             os.makedirs(self.tempwritedir)
@@ -282,16 +364,6 @@ class BaseParticleFile(ABC):
             with open(tmpfilename, 'wb') as f:
                 np.save(f, data_dict_once)
             self.file_list_once.append(tmpfilename)
-
-    @abstractmethod
-    def get_pset_info_attributes(self):
-        """
-        returns the main attributes of the pset_info.npy file.
-
-        Attention:
-        For ParticleSet structures other than SoA, and structures where ID != index, this has to be overridden.
-        """
-        return None
 
     def dump_psetinfo_to_npy(self):
         """
@@ -321,7 +393,7 @@ class BaseParticleFile(ABC):
         self.dump_psetinfo_to_npy()
 
     @abstractmethod
-    def read_from_npy(self, file_list, time_steps, var):
+    def read_from_npy(self, file_list, var, dtype, time_steps=None, n_timesteps=None):
         """
         Read NPY-files for one variable using a loop over all files.
 
@@ -330,6 +402,8 @@ class BaseParticleFile(ABC):
 
         :param file_list: List that  contains all file names in the output directory
         :param time_steps: Number of time steps that were written in out directory
+        :param n_timesteps: Dictionary with (for each particle) number of time steps that were written in out directory
+        :param dtype: 'dtype' of the variable's data to be written
         :param var: name of the variable to read
         """
         return None

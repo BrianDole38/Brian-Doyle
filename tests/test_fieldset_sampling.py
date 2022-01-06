@@ -2,15 +2,19 @@ from parcels import (FieldSet, Field, NestedField, ScipyParticle, JITParticle, G
                      AdvectionRK4, AdvectionRK4_3D, Variable, ErrorCode)
 from parcels import ParticleSetSOA, ParticleFileSOA, KernelSOA  # noqa
 from parcels import ParticleSetAOS, ParticleFileAOS, KernelAOS  # noqa
+from parcels import ParticleSetNodes, ParticleFileNodes, KernelNodes  # noqa
+from parcels import GenerateID_Service, SequentialIdGenerator, LibraryRegisterC  # noqa
 import numpy as np
 import pytest
 from math import cos, pi
 from datetime import timedelta as delta
 
-pset_modes = ['soa', 'aos']
+pset_modes_no_nodes = ['soa', 'aos']
+pset_modes = ['soa', 'aos', 'nodes']
 ptype = {'scipy': ScipyParticle, 'jit': JITParticle}
 pset_type = {'soa': {'pset': ParticleSetSOA, 'pfile': ParticleFileSOA, 'kernel': KernelSOA},
-             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS}}
+             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS},
+             'nodes': {'pset': ParticleSetNodes, 'pfile': ParticleFileNodes, 'kernel': KernelNodes}}
 
 
 def pclass(mode):
@@ -238,6 +242,9 @@ def test_nearest_neighbour_interpolation3D(pset_mode, mode, k_sample_p, npart=81
 @pytest.mark.parametrize('mode', ['scipy', 'jit'])
 @pytest.mark.parametrize('arrtype', ['ones', 'rand'])
 def test_inversedistance_nearland(pset_mode, mode, arrtype, k_sample_p, npart=81):
+    idgen = None
+    c_lib_register = None
+
     dims = (4, 4, 6)
     P = np.random.rand(dims[0], dims[1], dims[2])+2 if arrtype == 'rand' else np.ones(dims, dtype=np.float32)
     P[1, 1:2, 1:6] = np.nan  # setting some values to land (NaN)
@@ -251,12 +258,25 @@ def test_inversedistance_nearland(pset_mode, mode, arrtype, k_sample_p, npart=81
     fieldset.P.interp_method = 'linear_invdist_land_tracer'
 
     xv, yv = np.meshgrid(np.linspace(0.1, 0.9, int(np.sqrt(npart))), np.linspace(0.1, 0.9, int(np.sqrt(npart))))
-    # combine a pset at 0m with pset at 1m, as meshgrid does not do 3D
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
-                                        depth=np.zeros(npart))
-    pset2 = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
-                                         depth=np.ones(npart))
-    pset.add(pset2)
+    pset = None
+    if pset_mode != 'nodes':
+        # combine a pset at 0m with pset at 1m, as meshgrid does not do 3D
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
+                                            depth=np.zeros(npart))
+        pset2 = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
+                                             depth=np.ones(npart))
+        pset.add(pset2)
+    else:
+        idgen = GenerateID_Service(SequentialIdGenerator)
+        idgen.setDepthLimits(0., 1.0)
+        idgen.setTimeLine(0.0, 1.0)
+        c_lib_register = LibraryRegisterC()
+        # combine a pset at 0m with pset at 1m, as meshgrid does not do 3D
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
+                                            depth=np.zeros(npart), idgen=idgen, c_lib_register=c_lib_register)
+        pset2 = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=xv.flatten(), lat=yv.flatten(),
+                                             depth=np.ones(npart), idgen=idgen, c_lib_register=c_lib_register)
+        pset.add(pset2)
     pset.execute(k_sample_p, endtime=1, dt=1)
     if arrtype == 'rand':
         assert np.all((pset.p > 2) & (pset.p < 3))
@@ -270,6 +290,14 @@ def test_inversedistance_nearland(pset_mode, mode, arrtype, k_sample_p, npart=81
     except NotImplementedError:
         success = True
     assert success
+
+    del pset
+    if idgen is not None:
+        idgen.close()
+        del idgen
+    if c_lib_register is not None:
+        c_lib_register.clear()
+        del c_lib_register
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -307,14 +335,28 @@ def test_partialslip_nearland_zonal(pset_mode, mode, boundaryslip, withW, withT,
                                         lat=np.linspace(0.1, 3.9, npart), depth=np.zeros(npart))
     kernel = AdvectionRK4_3D if withW else AdvectionRK4
     pset.execute(kernel, endtime=1, dt=1)
+    p0 = None
+    p1 = None
+    pm1 = None
+    pm2 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+        p1 = pset[1]
+        pm1 = pset[-1]
+        pm2 = pset[-2]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+        p1 = pset.begin().next.data
+        pm1 = pset.end().data
+        pm2 = pset.end().prev.data
     if boundaryslip == 'partialslip':
         assert np.allclose([p.lon for p in pset if p.lat >= 0.5 and p.lat <= 3.5], 0.1)
-        assert np.allclose([pset[0].lon, pset[-1].lon], 0.06)
-        assert np.allclose([pset[1].lon, pset[-2].lon], 0.08)
+        assert np.allclose([p0.lon, pm1.lon], 0.06)
+        assert np.allclose([p1.lon, pm2.lon], 0.08)
         if withW:
             assert np.allclose([p.depth for p in pset if p.lat >= 0.5 and p.lat <= 3.5], 0.1)
-            assert np.allclose([pset[0].depth, pset[-1].depth], 0.06)
-            assert np.allclose([pset[1].depth, pset[-2].depth], 0.08)
+            assert np.allclose([p0.depth, pm1.depth], 0.06)
+            assert np.allclose([p1.depth, pm2.depth], 0.08)
     else:
         assert np.allclose([p.lon for p in pset], 0.1)
         if withW:
@@ -349,14 +391,28 @@ def test_partialslip_nearland_meridional(pset_mode, mode, boundaryslip, withW, n
                                         lon=np.linspace(0.1, 3.9, npart), depth=np.zeros(npart))
     kernel = AdvectionRK4_3D if withW else AdvectionRK4
     pset.execute(kernel, endtime=1, dt=1)
+    p0 = None
+    p1 = None
+    pm1 = None
+    pm2 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+        p1 = pset[1]
+        pm1 = pset[-1]
+        pm2 = pset[-2]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+        p1 = pset.begin().next.data
+        pm1 = pset.end().data
+        pm2 = pset.end().prev.data
     if boundaryslip == 'partialslip':
         assert np.allclose([p.lat for p in pset if p.lon >= 0.5 and p.lon <= 3.5], 0.1)
-        assert np.allclose([pset[0].lat, pset[-1].lat], 0.06)
-        assert np.allclose([pset[1].lat, pset[-2].lat], 0.08)
+        assert np.allclose([p0.lat, pm1.lat], 0.06)
+        assert np.allclose([p1.lat, pm2.lat], 0.08)
         if withW:
             assert np.allclose([p.depth for p in pset if p.lon >= 0.5 and p.lon <= 3.5], 0.1)
-            assert np.allclose([pset[0].depth, pset[-1].depth], 0.06)
-            assert np.allclose([pset[1].depth, pset[-2].depth], 0.08)
+            assert np.allclose([p0.depth, pm1.depth], 0.06)
+            assert np.allclose([p1.depth, pm2.depth], 0.08)
     else:
         assert np.allclose([p.lat for p in pset], 0.1)
         if withW:
@@ -381,11 +437,25 @@ def test_partialslip_nearland_vertical(pset_mode, mode, boundaryslip, npart=20):
     pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=np.zeros(npart), lat=np.zeros(npart),
                                         depth=np.linspace(0.1, 3.9, npart))
     pset.execute(AdvectionRK4, endtime=1, dt=1)
+    p0 = None
+    p1 = None
+    pm1 = None
+    pm2 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+        p1 = pset[1]
+        pm1 = pset[-1]
+        pm2 = pset[-2]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+        p1 = pset.begin().next.data
+        pm1 = pset.end().data
+        pm2 = pset.end().prev.data
     if boundaryslip == 'partialslip':
         assert np.allclose([p.lon for p in pset if p.depth >= 0.5 and p.depth <= 3.5], 0.1)
         assert np.allclose([p.lat for p in pset if p.depth >= 0.5 and p.depth <= 3.5], 0.1)
-        assert np.allclose([pset[0].lon, pset[-1].lon, pset[0].lat, pset[-1].lat], 0.06)
-        assert np.allclose([pset[1].lon, pset[-2].lon, pset[1].lat, pset[-2].lat], 0.08)
+        assert np.allclose([p0.lon, pm1.lon, p0.lat, pm1.lat], 0.06)
+        assert np.allclose([p1.lon, pm2.lon, p1.lat, pm2.lat], 0.08)
     else:
         assert np.allclose([p.lon for p in pset], 0.1)
         assert np.allclose([p.lat for p in pset], 0.1)
@@ -499,10 +569,18 @@ def test_meridionalflow_spherical(pset_mode, mode, xdim=100, ydim=200):
     pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=lonstart, lat=latstart)
     pset.execute(pset.Kernel(AdvectionRK4), runtime=runtime, dt=delta(hours=1))
 
-    assert(pset.lat[0] - (latstart[0] + runtime.total_seconds() * maxvel / 1852 / 60) < 1e-4)
-    assert(pset.lon[0] - lonstart[0] < 1e-4)
-    assert(pset.lat[1] - (latstart[1] + runtime.total_seconds() * maxvel / 1852 / 60) < 1e-4)
-    assert(pset.lon[1] - lonstart[1] < 1e-4)
+    p0 = None
+    p1 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+        p1 = pset[1]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+        p1 = pset.begin().next.data
+    assert(p0.lat - (latstart[0] + runtime.total_seconds() * maxvel / 1852 / 60) < 1e-4)
+    assert(p0.lon - lonstart[0] < 1e-4)
+    assert(p1.lat - (latstart[1] + runtime.total_seconds() * maxvel / 1852 / 60) < 1e-4)
+    assert(p1.lon - lonstart[1] < 1e-4)
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -530,14 +608,22 @@ def test_zonalflow_spherical(pset_mode, mode, k_sample_p, xdim=100, ydim=200):
     pset.execute(pset.Kernel(AdvectionRK4) + k_sample_p,
                  runtime=runtime, dt=delta(hours=1))
 
-    assert(pset.lat[0] - latstart[0] < 1e-4)
-    assert(pset.lon[0] - (lonstart[0] + runtime.total_seconds() * maxvel / 1852 / 60
-                          / cos(latstart[0] * pi / 180)) < 1e-4)
-    assert(abs(pset.p[0] - p_fld) < 1e-4)
-    assert(pset.lat[1] - latstart[1] < 1e-4)
-    assert(pset.lon[1] - (lonstart[1] + runtime.total_seconds() * maxvel / 1852 / 60
-                          / cos(latstart[1] * pi / 180)) < 1e-4)
-    assert(abs(pset.p[1] - p_fld) < 1e-4)
+    p0 = None
+    p1 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+        p1 = pset[1]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+        p1 = pset.begin().next.data
+    assert(p0.lat - latstart[0] < 1e-4)
+    assert(p0.lon - (lonstart[0] + runtime.total_seconds() * maxvel / 1852 / 60
+                     / cos(latstart[0] * pi / 180)) < 1e-4)
+    assert(abs(p0.p - p_fld) < 1e-4)
+    assert(p1.lat - latstart[1] < 1e-4)
+    assert(p1.lon - (lonstart[1] + runtime.total_seconds() * maxvel / 1852 / 60
+                     / cos(latstart[1] * pi / 180)) < 1e-4)
+    assert(abs(p1.p - p_fld) < 1e-4)
 
 
 @pytest.mark.parametrize('pset_mode', pset_modes)
@@ -669,7 +755,7 @@ def test_sampling_multigrids_non_vectorfield_from_file(pset_mode, mode, npart, t
             assert np.all(pset.yi >= 0)
             assert np.all(pset.yi[:, fieldset.B.igrid] < ydim * 3)
             assert np.all(pset.yi[:, 0] < ydim)
-        elif pset_mode == 'aos':
+        elif pset_mode in ['aos', 'nodes']:
             assert np.alltrue([[pxi > 0 for pxi in p.xi] for p in pset])
             assert np.alltrue([len(p.xi) == fieldset.gridset.size for p in pset])
             assert np.alltrue([p.xi[fieldset.B.igrid] < xdim * 4 for p in pset])
@@ -725,7 +811,7 @@ def test_sampling_multigrids_non_vectorfield(pset_mode, mode, npart):
             assert np.all(pset.yi >= 0)
             assert np.all(pset.yi[:, fieldset.B.igrid] < ydim * 3)
             assert np.all(pset.yi[:, 0] < ydim)
-        elif pset_mode == 'aos':
+        elif pset_mode in ['aos', 'nodes']:
             assert np.alltrue([[pxi > 0 for pxi in p.xi] for p in pset])
             assert np.alltrue([len(p.xi) == fieldset.gridset.size for p in pset])
             assert np.alltrue([p.xi[fieldset.B.igrid] < xdim * 4 for p in pset])
@@ -736,7 +822,7 @@ def test_sampling_multigrids_non_vectorfield(pset_mode, mode, npart):
             assert np.alltrue([p.yi[0] < ydim for p in pset])
 
 
-@pytest.mark.parametrize('pset_mode', pset_modes)
+@pytest.mark.parametrize('pset_mode', pset_modes_no_nodes)
 @pytest.mark.parametrize('mode', ['jit', 'scipy'])
 @pytest.mark.parametrize('ugridfactor', [1, 10])
 def test_sampling_multiple_grid_sizes(pset_mode, mode, ugridfactor):
@@ -755,8 +841,13 @@ def test_sampling_multiple_grid_sizes(pset_mode, mode, ugridfactor):
     else:
         assert fieldset.U.grid is fieldset.V.grid
     pset.execute(AdvectionRK4, runtime=10, dt=1)
-    assert np.isclose(pset.lon[0], 0.8)
-    assert np.all((0 <= pset.xi) & (pset.xi < xdim*ugridfactor))
+    if pset_mode == 'soa':
+        assert np.isclose(pset.lon[0], 0.8)
+        assert np.all((0 <= pset.xi) & (pset.xi < xdim*ugridfactor))
+    elif pset_mode in ['aos', 'nodes']:
+        p0 = pset[0] if pset_mode == 'aos' else pset.begin().data
+        assert np.isclose(p0.lon, 0.8)
+        assert np.all([[pxi >= 0 for pxi in p.xi] for p in pset]) and np.all([[pxi < xdim*ugridfactor for pxi in p.xi] for p in pset])
 
 
 def test_multiple_grid_addlater_error():
@@ -783,7 +874,7 @@ def test_multiple_grid_addlater_error():
     assert fail
 
 
-@pytest.mark.parametrize('pset_mode', pset_modes)
+@pytest.mark.parametrize('pset_mode', pset_modes_no_nodes)
 @pytest.mark.parametrize('mode', ['jit', 'scipy'])
 @pytest.mark.parametrize('with_W', [True, False])
 @pytest.mark.parametrize('mesh', ['flat', 'spherical'])
@@ -826,9 +917,15 @@ def test_summedfields(pset_mode, mode, with_W, k_sample_p, mesh):
     else:
         pset = pset_type[pset_mode]['pset'](fieldsetS, pclass=pclass(mode), lon=[0], lat=[0.9])
         pset.execute(AdvectionRK4+pset.Kernel(k_sample_p), runtime=2, dt=1)
-    assert np.isclose(pset.p[0], 60)
-    assert np.isclose(pset.lon[0]*conv, 0.6, atol=1e-3)
-    assert np.isclose(pset.lat[0], 0.9)
+
+    p0 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+    assert np.isclose(p0.p, 60)
+    assert np.isclose(p0.lon*conv, 0.6, atol=1e-3)
+    assert np.isclose(p0.lat, 0.9)
     assert np.allclose(fieldsetS.UV[0][0, 0, 0, 0], [.2/conv, 0])
 
 
@@ -855,9 +952,11 @@ def test_summedfields_slipinterp_warning(boundaryslip):
         fieldsetS.check_complete()
 
 
-@pytest.mark.parametrize('pset_mode', pset_modes)
+@pytest.mark.parametrize('pset_mode', pset_modes_no_nodes)
 @pytest.mark.parametrize('mode', ['jit', 'scipy'])
 def test_nestedfields(pset_mode, mode, k_sample_p):
+    idgen = None
+    c_lib_register = None
     xdim = 10
     ydim = 20
 
@@ -892,16 +991,52 @@ def test_nestedfields(pset_mode, mode, k_sample_p):
         particle.p = 999
         particle.time = particle.time + particle.dt
 
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[.3])
+    if pset_mode == 'nodes':
+        idgen = GenerateID_Service(SequentialIdGenerator)
+        idgen.setDepthLimits(0., 1.0)
+        idgen.setTimeLine(0.0, 10.0)
+        idgen.enable_ID_recovery()
+        c_lib_register = LibraryRegisterC()
+    pset = None
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[.3])
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[.3], idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(AdvectionRK4+pset.Kernel(k_sample_p), runtime=1, dt=1)
-    assert np.isclose(pset.lat[0], .5)
-    assert np.isclose(pset.p[0], .1)
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[1.3])
+
+    p0 = None
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+    assert np.isclose(p0.lat, .5)
+    assert np.isclose(p0.p, .1)
+    del pset
+
+    pset = None
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[1.3])
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[1.3], idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(AdvectionRK4+pset.Kernel(k_sample_p), runtime=1, dt=1)
-    assert np.isclose(pset.lat[0], 1.7)
-    assert np.isclose(pset.p[0], .2)
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[2.3])
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+    assert np.isclose(p0.lat, 1.7)
+    assert np.isclose(p0.p, .2)
+    del pset
+
+    pset = None
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[2.3])
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=pclass(mode), lon=[0], lat=[2.3], idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(AdvectionRK4+pset.Kernel(k_sample_p), runtime=1, dt=1, recovery={ErrorCode.ErrorOutOfBounds: Recover})
-    assert np.isclose(pset.lat[0], -1)
-    assert np.isclose(pset.p[0], 999)
+    if pset_mode in ['soa', 'aos']:
+        p0 = pset[0]
+    elif pset_mode == 'nodes':
+        p0 = pset.begin().data
+    assert np.isclose(p0.lat, -1)
+    assert np.isclose(p0.p, 999)
     assert np.allclose(fieldset.UV[0][0, 0, 0, 0], [.1, .2])

@@ -1,6 +1,8 @@
 from parcels import FieldSet, ScipyParticle, JITParticle, Variable, StateCode
 from parcels import ParticleSetSOA, ParticleFileSOA, KernelSOA  # noqa
 from parcels import ParticleSetAOS, ParticleFileAOS, KernelAOS  # noqa
+from parcels import ParticleSetNodes, ParticleFileNodes, KernelNodes  # noqa
+from parcels import GenerateID_Service, SequentialIdGenerator, LibraryRegisterC  # noqa
 from parcels.application_kernels.TEOSseawaterdensity import PolyTEOS10_bsq
 from parcels.application_kernels.EOSseawaterproperties import PressureFromLatDepth, PtempFromTemp, TempFromPtemp, UNESCODensity
 from parcels import ParcelsRandom
@@ -10,10 +12,11 @@ import random as py_random
 from os import path
 import sys
 
-pset_modes = ['soa', 'aos']
+pset_modes = ['soa', 'aos', 'nodes']
 ptype = {'scipy': ScipyParticle, 'jit': JITParticle}
 pset_type = {'soa': {'pset': ParticleSetSOA, 'pfile': ParticleFileSOA, 'kernel': KernelSOA},
-             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS}}
+             'aos': {'pset': ParticleSetAOS, 'pfile': ParticleFileAOS, 'kernel': KernelAOS},
+             'nodes': {'pset': ParticleSetNodes, 'pfile': ParticleFileNodes, 'kernel': KernelNodes}}
 
 
 def expr_kernel(name, pset, expr, pset_mode):
@@ -449,6 +452,14 @@ def test_TEOSdensity_kernels(pset_mode, mode):
 @pytest.mark.parametrize('pset_mode', pset_modes)
 @pytest.mark.parametrize('mode', ['scipy', 'jit'])
 def test_EOSseawaterproperties_kernels(pset_mode, mode):
+    idgen = None
+    c_lib_register = None
+    if pset_mode == 'nodes':
+        idgen = GenerateID_Service(SequentialIdGenerator)
+        idgen.setDepthLimits(0., 1.0)
+        idgen.setTimeLine(0.0, 1.0)
+        c_lib_register = LibraryRegisterC()
+
     fieldset = FieldSet.from_data(data={'U': 0, 'V': 0,
                                         'psu_salinity': 40,
                                         'temperature': 40,
@@ -459,20 +470,32 @@ def test_EOSseawaterproperties_kernels(pset_mode, mode):
     class PoTempParticle(ptype[mode]):
         potemp = Variable('potemp', dtype=np.float32)
         pressure = Variable('pressure', dtype=np.float32, initial=10000)
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=PoTempParticle, lon=5, lat=5, depth=1000)
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=PoTempParticle, lon=5, lat=5, depth=1000)
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=PoTempParticle, lon=5, lat=5, depth=1000,
+                                            idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(PtempFromTemp, runtime=0, dt=0)
     assert np.allclose(pset[0].potemp, 36.89073)
 
     class TempParticle(ptype[mode]):
         temp = Variable('temp', dtype=np.float32)
         pressure = Variable('pressure', dtype=np.float32, initial=10000)
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=5, depth=1000)
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=5, depth=1000)
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=5, depth=1000,
+                                            idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(TempFromPtemp, runtime=0, dt=0)
     assert np.allclose(pset[0].temp, 40)
 
     class TPressureParticle(ptype[mode]):
         pressure = Variable('pressure', dtype=np.float32)
-    pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=30, depth=7321.45)
+    if pset_mode != 'nodes':
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=30, depth=7321.45)
+    else:
+        pset = pset_type[pset_mode]['pset'](fieldset, pclass=TempParticle, lon=5, lat=30, depth=7321.45,
+                                            idgen=idgen, c_lib_register=c_lib_register)
     pset.execute(PressureFromLatDepth, runtime=0, dt=0)
     assert np.allclose(pset[0].pressure, 7500, atol=1e-2)
 

@@ -1,4 +1,5 @@
 import re
+import sys
 import _ctypes
 import inspect
 import numpy.ctypeslib as npct
@@ -32,6 +33,7 @@ from parcels.field import TimeExtrapolationError
 from parcels.tools.statuscodes import StateCode, OperationCode, ErrorCode
 from parcels.application_kernels.advection import AdvectionRK4_3D
 from parcels.application_kernels.advection import AdvectionAnalytical
+from parcels.compilation import CCompiler_MS, CCompiler_SS
 
 __all__ = ['BaseKernel']
 
@@ -58,8 +60,20 @@ class BaseKernel(object):
     _ptype = None
     funcname = None
 
-    def __init__(self, fieldset, ptype, pyfunc=None, funcname=None, funccode=None, py_ast=None, funcvars=None,
+    def __init__(self, fieldset, ptype, pyfunc=None, funcname=None, funccode=None, funcvars=None, py_ast=None,
                  c_include="", delete_cfiles=True):
+        """
+        BaseKernel - Constructor
+        :arg fieldset: the fieldset object of the host ParticleSet
+        :arg ptype: the ParticleType of the host ParticleSet
+        :arg pyfunc: the initial Python func or a concatenation of BaseKernel's hosting the kernel code
+        :arg funcname: None, if :arg pyfunc is a concatenated kernel or python function; otherwise, name of the custom function
+        :arg funccode: None, if :arg pyfunc is a concatenated kernel or python function; otherwise, string of code of the custom function
+        :arg funcvars: None, if :arg pyfunc is a concatenated kernel or python function; otherwise, variables of the custom function
+        :arg py_ast: a parsed hierarchy of generated functions
+        :arg c_include: added C include functions for generation or interpretation of the custom function
+        :arg delete_cfiles: boolean, indicating whether the written C source files are deleted on destruction
+        """
         self._fieldset = fieldset
         self.field_args = None
         self.const_args = None
@@ -74,25 +88,24 @@ class BaseKernel(object):
         self._pyfunc = None
         self.funcname = funcname or pyfunc.__name__
         self.name = "%s%s" % (ptype.name, self.funcname)
-        self.ccode = ""
+        self.ccode = None  # is either a single string (if just 1 dynamic source) or a list of strings (one for each dyn_src)
         self.funcvars = funcvars
         self.funccode = funccode
         self.py_ast = py_ast
-        self.dyn_srcs = []
-        self.static_srcs = []
-        self.src_file = None
+        self.dyn_srcs = None  # holds paths to all dynamically-created source files, either single string or list (corresponding to ccode)
+        self.static_srcs = None  # all static source files
+        self._src_files = None  # all to-be-considered source files - should be private (no set by subclass)
         self.lib_file = None
         self.log_file = None
 
         # Generate the kernel function and add the outer loop
         if self._ptype.uses_jit:
-            src_file_or_files, self.lib_file, self.log_file = self.get_kernel_compile_files()
-            if type(src_file_or_files) in (list, dict, tuple, ndarray):
-                self.dyn_srcs = src_file_or_files
-            else:
-                self.src_file = src_file_or_files
+            self.generate_sources()
 
     def __del__(self):
+        """
+        BaseKernel - Destructor
+        """
         # Clean-up the in-memory dynamic linked libraries.
         # This is not really necessary, as these programs are not that large, but with the new random
         # naming scheme which is required on Windows OS'es to deal with updates to a Parcels' kernel.
@@ -105,6 +118,24 @@ class BaseKernel(object):
         self.const_args = None
         self.funcvars = None
         self.funccode = None
+        self.py_ast = None
+        self.dyn_srcs = None
+        self.static_srcs = None
+        self._src_files = None
+        self.lib_file = None
+        self.log_file = None
+
+    def __sizeof__(self):
+        sz = sys.getsizeof(self._lib) if self._lib is not None else 0
+        sz += sys.getsizeof(self._cleanup_files) if self._cleanup_files is not None else 0
+        sz += sys.getsizeof(self._cleanup_lib) if self._cleanup_lib is not None else 0
+        sz += sys.getsizeof(self._c_include) if self._c_include is not None else 0
+        sz += sys.getsizeof(self.dyn_srcs) if self.dyn_srcs is not None else 0
+        sz += sys.getsizeof(self.static_srcs) if self.static_srcs is not None else 0
+        sz += sys.getsizeof(self._src_files) if self._src_files is not None else 0
+        sz += sys.getsizeof(self.lib_file) if self.lib_file is not None else 0
+        sz += sys.getsizeof(self.log_file) if self.log_file is not None else 0
+        return sz
 
     @property
     def ptype(self):
@@ -133,17 +164,28 @@ class BaseKernel(object):
 
     @staticmethod
     def fix_indentation(string):
-        """Fix indentation to allow in-lined kernel definitions"""
+        """
+        Fix indentation to allow in-lined kernel definitions
+        :arg string: code string for which the indentation is to be checked and fixed
+        """
         lines = string.split('\n')
         indent = re_indent.match(lines[0])
         if indent:
             lines = [line.replace(indent.groups()[0], '', 1) for line in lines]
         return "\n".join(lines)
 
+    def generate_sources(self):
+        """
+        Generates and compiles a kernel with its source(s)
+        """
+        src_file_or_files, self.lib_file, self.log_file = self.get_kernel_compile_files()
+        self.dyn_srcs = src_file_or_files
+
     def check_fieldsets_in_kernels(self, pyfunc):
         """
         function checks the integrity of the fieldset with the kernels.
         This function is to be called from the derived class when setting up the 'pyfunc'.
+        :arg pyfunc: Python function to be checked for fieldset consistency
         """
         if self.fieldset is not None:
             if pyfunc is AdvectionRK4_3D:
@@ -168,7 +210,7 @@ class BaseKernel(object):
 
     def check_kernel_signature_on_version(self):
         """
-        returns numkernelargs
+        :returns numkernelargs
         """
         numkernelargs = 0
         if self._pyfunc is not None:
@@ -179,18 +221,20 @@ class BaseKernel(object):
         return numkernelargs
 
     def remove_lib(self):
+        """
+        Ultimately removing a (compiled and loaded) library, and regenerates new sources files.
+        This latter process is needed due to compiler quirks on Windows.
+        """
         if self._lib is not None:
             BaseKernel.cleanup_unload_lib(self._lib)
             del self._lib
             self._lib = None
 
         all_files_array = []
-        if self.src_file is None:
-            if self.dyn_srcs is not None:
-                [all_files_array.append(fpath) for fpath in self.dyn_srcs]
-        else:
-            if self.src_file is not None:
-                all_files_array.append(self.src_file)
+        if self.dyn_srcs is not None:
+            if type(self.dyn_srcs) not in (list, dict, tuple) or isinstance(self.dyn_srcs, str):
+                self.dyn_srcs = [self.dyn_srcs, ]
+            [all_files_array.append(fpath) for fpath in self.dyn_srcs]
         if self.log_file is not None:
             all_files_array.append(self.log_file)
         if self.lib_file is not None and all_files_array is not None and self.delete_cfiles is not None:
@@ -199,11 +243,7 @@ class BaseKernel(object):
         # If file already exists, pull new names. This is necessary on a Windows machine, because
         # Python's ctype does not deal in any sort of manner well with dynamic linked libraries on this OS.
         if self._ptype.uses_jit:
-            src_file_or_files, self.lib_file, self.log_file = self.get_kernel_compile_files()
-            if type(src_file_or_files) in (list, dict, tuple, ndarray):
-                self.dyn_srcs = src_file_or_files
-            else:
-                self.src_file = src_file_or_files
+            self.generate_sources()
 
     def get_kernel_compile_files(self):
         """
@@ -222,7 +262,11 @@ class BaseKernel(object):
             cache_name = self._cache_key  # only required here because loading is done by Kernel class instead of Compiler class
             dyn_dir = get_cache_dir()
             basename = "%s_0" % cache_name
-        lib_path = "lib" + basename
+        lib_path = None
+        if platform == 'linux' or platform == 'darwin':
+            lib_path = "lib" + basename
+        else:
+            lib_path = basename
         src_file_or_files = None
         if type(basename) in (list, dict, tuple, ndarray):
             src_file_or_files = ["", ] * len(basename)
@@ -235,32 +279,53 @@ class BaseKernel(object):
         return src_file_or_files, lib_file, log_file
 
     def compile(self, compiler):
-        """ Writes kernel code to file and compiles it."""
-        all_files_array = []
-        if self.src_file is None:
-            if self.dyn_srcs is not None:
-                for dyn_src in self.dyn_srcs:
-                    with open(dyn_src, 'w') as f:
-                        f.write(self.ccode)
-                    all_files_array.append(dyn_src)
-                compiler.compile(self.dyn_srcs, self.lib_file, self.log_file)
+        """
+        Writes kernel code to file and compiles it.
+        :arg compiler: the head (C-)compiler used for code compilations; instance of derived class of 'CCompiler'
+        """
+        if type(self.dyn_srcs) not in (list, dict, tuple) or isinstance(self.dyn_srcs, str):
+            self.dyn_srcs = [self.dyn_srcs, ]
+        if type(self.ccode) not in (list, dict, tuple) or isinstance(self.ccode, str):
+            self.ccode = [self.ccode, ]
+        if self.static_srcs is None or (type(self.static_srcs) is list and len(self.static_srcs) == 0):
+            self.static_srcs = []
         else:
-            if self.src_file is not None:
-                with open(self.src_file, 'w') as f:
-                    f.write(self.ccode)
-                if self.src_file is not None:
-                    all_files_array.append(self.src_file)
-                compiler.compile(self.src_file, self.lib_file, self.log_file)
+            assert isinstance(compiler, CCompiler_MS)
+            if type(self.static_srcs) not in (list, dict, tuple) or isinstance(self.static_srcs, str):
+                self.static_srcs = [self.static_srcs, ]
+        self._src_files = self.dyn_srcs + self.static_srcs
+        all_files_array = []
+        if isinstance(compiler, CCompiler_SS):  # if we only have a single-stage compiler, we can only have one source file, so take the first (dynamic) source
+            self.dyn_srcs = [self.dyn_srcs[0], ] if self.dyn_srcs is not None else None
+            self.ccode = [self.ccode[0], ]
+            self._src_files = self._src_files[0]  # shall not be a list, cause the single-stage compiler expects a single source file string
+        if self.dyn_srcs is not None:
+            assert len(self.dyn_srcs) == len(self.ccode)
+            for i in range(len(self.dyn_srcs)):
+                dyn_src = self.dyn_srcs[i]
+                ccode_str = self.ccode[i]
+                with open(dyn_src, 'w') as f:
+                    f.write(ccode_str)
+                all_files_array.append(dyn_src)
+        compiler.compile(self._src_files, self.lib_file, self.log_file)  # self._src_files includes dyn. & stat. source files
         if len(all_files_array) > 0:
             logger.info("Compiled %s ==> %s" % (self.name, self.lib_file))
             if self.log_file is not None:
                 all_files_array.append(self.log_file)
 
     def load_lib(self):
+        """
+        Loads the compiled kernel into memory, to be used for kernel execution.
+        """
         self._lib = npct.load_library(self.lib_file, '.')
         self._function = self._lib.particle_loop
 
     def merge(self, kernel, kclass):
+        """
+        Merging two (possibly disparate) kernels of the same kind of ParticleSet.
+        :arg kernel: new additional kernel to be merged into this kernel
+        :arg kclass: the actual, derived, specific KernelClass of the new, merged kernel
+        """
         funcname = self.funcname + kernel.funcname
         func_ast = None
         if self.py_ast is not None:
@@ -274,25 +339,47 @@ class BaseKernel(object):
                       delete_cfiles=delete_cfiles)
 
     def __add__(self, kernel):
+        """
+        Adds (via '+') one kernel to another. In the expression
+        k = a + b
+        this function covers the case where at least 'a' is a BaseKernel.
+        :arg kernel: BaseKernel or python function object to be merged (i.e. added)
+        """
         if not isinstance(kernel, BaseKernel):
             kernel = BaseKernel(self.fieldset, self.ptype, pyfunc=kernel)
         return self.merge(kernel, BaseKernel)
 
     def __radd__(self, kernel):
+        """
+        Adds (via '+') one kernel to another. In the expression
+        k = a + b
+        this function covers the case where at least 'b' is a BaseKernel.
+        :arg kernel: BaseKernel or python function object to be merged (i.e. added)
+        """
         if not isinstance(kernel, BaseKernel):
             kernel = BaseKernel(self.fieldset, self.ptype, pyfunc=kernel)
         return kernel.merge(self, BaseKernel)
 
     @staticmethod
     def cleanup_remove_files(lib_file, all_files_array, delete_cfiles):
+        """
+        Explicitly clearing up files on Kernel destruction.
+        :arg lib_file: array of library files
+        :arg all_files_array: array of log-files and (potentially) source-files
+        :arg delete_cfiles: boolean flag, telling if source files are to be deleted or not
+        """
         if lib_file is not None:
-            if path.isfile(lib_file):  # and delete_cfiles
+            if path.isfile(lib_file):
                 [remove(s) for s in [lib_file, ] if path is not None and path.exists(s)]
             if delete_cfiles and len(all_files_array) > 0:
                 [remove(s) for s in all_files_array if path is not None and path.exists(s)]
 
     @staticmethod
     def cleanup_unload_lib(lib):
+        """
+        Explicitly unloading a previously-loaded ctypes library
+        :arg lib: ctypes library object to be closed and removed
+        """
         # Clean-up the in-memory dynamic linked libraries.
         # This is not really necessary, as these programs are not that large, but with the new random
         # naming scheme which is required on Windows OS'es to deal with updates to a Parcels' kernel.
@@ -307,6 +394,9 @@ class BaseKernel(object):
         Utility to remove all particles that signalled deletion.
 
         This version is generally applicable to all structures and collections
+        :arg pset: host ParticleSet
+        :arg output_file: instance of ParticleFile object of the host ParticleSet where deleted objects are to be written to on deletion
+        :arg endtime: timestamp at which the particles are to be deleted
         """
         indices = [i for i, p in enumerate(pset) if p.state == OperationCode.Delete]
         if len(indices) > 0 and output_file is not None:
@@ -316,6 +406,7 @@ class BaseKernel(object):
     def load_fieldset_jit(self, pset):
         """
         Updates the loaded fields of pset's fieldset according to the chunk information within their grids
+        :arg pset: host ParticleSet
         """
         if pset.fieldset is not None:
             for g in pset.fieldset.gridset.grids:
@@ -373,7 +464,7 @@ class BaseKernel(object):
 
         # ==== numerically stable; also making sure that continuously-recovered particles do end successfully,
         # as they fulfil the condition here on entering at the final calculation here. ==== #
-        if ((sign_end_part != sign_dt) or np.isclose(dt_pos, 0)) and not np.isclose(dt, 0):
+        if ((sign_end_part != sign_dt) or np.isclose(dt_pos, 0, equal_nan=True)) and not np.isclose(dt, 0, equal_nan=True):
             if abs(p.time) >= abs(endtime):
                 p.set_state(StateCode.Success)
             return p
@@ -426,7 +517,7 @@ class BaseKernel(object):
                     reset_dt = False
 
                 sign_end_part = np.sign(endtime - p.time)
-                if res != OperationCode.Delete and not np.isclose(dt_pos, 0) and (sign_end_part == sign_dt):
+                if res != OperationCode.Delete and not np.isclose(dt_pos, 0, equal_nan=True) and (sign_end_part == sign_dt):
                     res = StateCode.Evaluate
                 if sign_end_part != sign_dt:
                     dt_pos = 0
